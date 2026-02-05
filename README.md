@@ -1,6 +1,7 @@
 # Zwift Fitness Sensor Relay
 
 A Bluetooth Low Energy (BLE) relay system that sits between fitness sensors (HR strap, power meter, smart trainer) and Zwift, enabling debugging of BLE traffic and working around incorrect handling of the "Set Indoor Bike Simulation Parameters" (0x11) FTMS control point command in the current smartroller firmware.
+The relay converts Zwift's `FTMS_CP_SET_INDOOR_BIKE_SIM` calls to `FTMS_CP_SET_TARGET_RESISTANCE`, which the trainer handles perfectly. The result is smooth, constant resistance during climbing!
 
 ## Project Overview
 
@@ -63,6 +64,8 @@ python run.py
 ```
 
 The dashboard will be available at `http://localhost:5000`
+
+![Zwift Data Visualization Dashboard](pictures/screenshot_server.png)
 
 ## Project Structure
 

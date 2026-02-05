@@ -1,0 +1,61 @@
+# Build artifacts
+dongle/build/
+*.o
+*.obj
+*.a
+*.elf
+*.bin
+*.hex
+*.map
+*.d
+*.cmake
+!CMakeLists.txt
+!**/CMakeLists.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Logs
+*.log
+log.txt
+log.log
+serial_log.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+*.bak
+
+# Zephyr/NCS specific
+west_workspace/
+.west/
+modules/
+zephyr_modules.txt
+sysbuild_modules.txt
+zephyr_settings.txt
+
+# Compiled files
+*.class
+*.dll
+*.exe
+
+# Temporary files
+*.tmp
+*.temp

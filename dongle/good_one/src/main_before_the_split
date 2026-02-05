@@ -1,0 +1,1595 @@
+/* main.c - Application main entry point */
+
+/*
+ * Copyright (c) 2015-2016 Intel Corporation
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <zephyr/kernel.h>
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <string.h>
+
+#include "common.h"
+#include "gatt_services.h"
+#include "ftms_control_point.h"
+#include "notification_handler.h"
+#include "device_manager.h"
+#include "gatt_discovery.h"
+
+/* Global variables */
+struct conn_slot connections[MAX_CONNECTIONS];
+struct bt_gatt_subscribe_params subscribe_ring_buffer[SUBSCRIPTION_RING_BUFFER_SIZE];
+int next_subscribe_slot = 0;
+struct bt_conn *peripheral_conn = NULL;
+uint32_t last_cp_data_time = 0;
+uint64_t total_rx_count = 0;
+
+/* Services to discover */
+const struct bt_uuid *discover_services[] = {
+	BT_UUID_HRS,
+	BT_UUID_CPS,
+	BT_UUID_FMS,
+};
+const int discover_service_count = ARRAY_SIZE(discover_services);
+
+static void connected(struct bt_conn *conn, uint8_t conn_err)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+	struct device_info *dev_info;
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	/* Find the connection slot */
+	struct conn_slot *slot = NULL;
+	int slot_idx = -1;
+	for (int i = 0; i < MAX_CONNECTIONS; i++) {
+		if (connections[i].conn == conn) {
+			slot = &connections[i];
+			slot_idx = i;
+			break;
+		}
+	}
+
+	if (!slot) {
+		printk("Connected but no slot found: %s\n", addr);
+		return;
+	}
+
+	if (conn_err) {
+		printk("Failed to connect to %s (%u)\n", addr, conn_err);
+		bt_conn_unref(slot->conn);
+		slot->conn = NULL;
+		start_scan();
+		return;
+	}
+
+	printk("Connected: %s\n", addr);
+	print_device_list();
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&device_list, dev_info, node) {
+		if (!bt_addr_le_cmp(&dev_info->addr, bt_conn_get_dst(conn))) {
+			dev_info->was_connected = true;
+			break;
+		}
+	}
+
+	/* Start discovery */
+	start_discovery(conn, slot_idx);
+}
+
+static void disconnected(struct bt_conn *conn, uint8_t reason)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	printk("Disconnected: %s, reason 0x%02x %s\n", addr, reason, bt_hci_err_to_str(reason));
+
+	/* Remove device from list */
+	struct device_info *dev_info, *tmp;
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&device_list, dev_info, tmp, node) {
+		if (!bt_addr_le_cmp(&dev_info->addr, bt_conn_get_dst(conn))) {
+			printk("Removed device from list: %s\n", dev_info->name);
+			sys_slist_find_and_remove(&device_list, &dev_info->node);
+			k_free(dev_info);
+			print_device_list();
+			break;
+		}
+	}
+
+	/* Find and clear the connection slot */
+	bool found_slot = false;
+	for (int i = 0; i < MAX_CONNECTIONS; i++) {
+		if (connections[i].conn == conn) {
+			printk("Clearing %d subscriptions for slot %d\n", 
+			       connections[i].subscribe_count, i);
+			
+			/* Clear the ring buffer slots */
+			for (int j = 0; j < connections[i].subscribe_count; j++) {
+				if (connections[i].subscribe_params[j]) {
+					memset(connections[i].subscribe_params[j], 0, 
+					       sizeof(struct bt_gatt_subscribe_params));
+				}
+			}
+			
+			bt_conn_unref(connections[i].conn);
+			memset(&connections[i], 0, sizeof(struct conn_slot));
+			printk("Freed connection slot %d\n", i);
+			found_slot = true;
+			break;
+		}
+	}
+
+	if (found_slot) {
+		/* Sensor disconnected */
+		start_scan();
+	} else {
+		/* Peripheral disconnected */
+		printk("Peripheral disconnected, restarting advertising\n");
+		
+		if (peripheral_conn == conn) {
+			bt_conn_unref(peripheral_conn);
+			peripheral_conn = NULL;
+			printk("[FTMS CP] Cleared peripheral connection\n");
+		}
+		
+		start_advertising();
+	}
+}
+
+BT_CONN_CB_DEFINE(conn_callbacks) = {
+	.connected = connected,
+	.disconnected = disconnected,
+};
+
+int main(void)
+{
+	int err;
+
+	err = bt_enable(NULL);
+
+	if (err) {
+		printk("Bluetooth init failed (err %d)\n", err);
+		return 0;
+	}
+
+	/* Initialize modules */
+	device_manager_init();
+	ftms_control_point_init();
+
+	/* Print initial device list */
+	print_device_list();
+
+	printk("Central HR Sample Version %s\n", VERSION);
+
+	bt_set_name("HR Relay");
+	printk("Bluetooth initialized as 'HR Relay'\n");
+
+	start_advertising();
+	start_scan();
+	return 0;
+}
+
+
+struct device_info {
+	sys_snode_t node;
+	bt_addr_le_t addr;
+	char name[32];
+	uint32_t last_seen;
+	uint8_t svc_mask;
+	bool was_connected; /* Track if we successfully connected before */
+};
+
+static sys_slist_t device_list;
+
+static void start_scan(void);
+static void start_advertising(void);
+
+#define MAX_CONNECTIONS 4
+#define MAX_SUBSCRIPTIONS_PER_CONN 4
+#define SUBSCRIPTION_RING_BUFFER_SIZE 10  /* Enough for 3+ reconnection cycles */
+
+/* Global ring buffer for all subscription parameters */
+static struct bt_gatt_subscribe_params subscribe_ring_buffer[SUBSCRIPTION_RING_BUFFER_SIZE];
+static int next_subscribe_slot = 0;
+
+struct conn_slot {
+	struct bt_conn *conn;
+	struct bt_uuid_16 discover_uuid;
+	struct bt_gatt_discover_params discover_params;
+	struct bt_gatt_subscribe_params *subscribe_params[MAX_SUBSCRIPTIONS_PER_CONN]; /* Pointers to ring buffer slots */
+	int service_type[MAX_SUBSCRIPTIONS_PER_CONN]; /* 0=HR, 1=CP, 2=FTMS */
+	int subscribe_count;
+	int discover_service_index;
+	uint16_t ftms_control_point_handle; /* For writing commands to trainer */
+	struct bt_gatt_indicate_params indicate_params; /* For receiving trainer responses */
+	uint16_t temp_value_handle; /* Temporary storage for value_handle during discovery */
+};
+
+static struct conn_slot connections[MAX_CONNECTIONS];
+
+/* Track peripheral (Zwift) connection for Control Point responses */
+static struct bt_conn *peripheral_conn = NULL;
+
+/* Buffer for Control Point indication responses */
+static uint8_t ftms_cp_response[20];
+static uint16_t ftms_cp_response_len;
+static bool ftms_cp_indicate_enabled = false;
+static struct bt_gatt_indicate_params ftms_cp_ind_params;
+static bool ftms_cp_indicating = false;
+
+/* Work item for sending deferred Control Point responses */
+static struct k_work ftms_cp_response_work;
+
+/* Forward declarations */
+static uint8_t discover_func(struct bt_conn *conn,
+			     const struct bt_gatt_attr *attr,
+			     struct bt_gatt_discover_params *params);
+static void start_scan(void);
+
+#define FTMS_CP_REQUEST_CONTROL           0x00
+#define FTMS_CP_RESET                     0x01
+#define FTMS_CP_SET_TARGET_SPEED          0x02
+#define FTMS_CP_SET_TARGET_INCLINATION    0x03
+#define FTMS_CP_SET_TARGET_RESISTANCE     0x04
+#define FTMS_CP_SET_TARGET_POWER          0x05
+#define FTMS_CP_SET_TARGET_HEARTRATE      0x06
+#define FTMS_CP_START_RESUME              0x07
+#define FTMS_CP_STOP_PAUSE                0x08
+#define FTMS_CP_RESPONSE_CODE             0x80
+
+/* Helper to get OpCode name */
+static const char *ftms_cp_opcode_str(uint8_t opcode)
+{
+	switch (opcode) {
+	case FTMS_CP_REQUEST_CONTROL:        return "Request Control";
+	case FTMS_CP_RESET:                  return "Reset";
+	case FTMS_CP_SET_TARGET_SPEED:       return "Set Target Speed";
+	case FTMS_CP_SET_TARGET_INCLINATION: return "Set Target Inclination";
+	case FTMS_CP_SET_TARGET_RESISTANCE:  return "Set Target Resistance";
+	case FTMS_CP_SET_TARGET_POWER:       return "Set Target Power";
+	case FTMS_CP_SET_TARGET_HEARTRATE:   return "Set Target Heart Rate";
+	case FTMS_CP_START_RESUME:           return "Start/Resume";
+	case FTMS_CP_STOP_PAUSE:             return "Stop/Pause";
+	case FTMS_CP_RESPONSE_CODE:          return "Response Code";
+	default:                             return "Unknown";
+	}
+}
+
+static void print_device_list(void)
+{
+	struct device_info *dev_info;
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	printk("Current device list:\n");
+	SYS_SLIST_FOR_EACH_CONTAINER(&device_list, dev_info, node) {
+		/* Check if device is connected */
+		bool is_connected = false;
+		for (int i = 0; i < MAX_CONNECTIONS; i++) {
+			if (connections[i].conn) {
+				const bt_addr_le_t *conn_addr = bt_conn_get_dst(connections[i].conn);
+				if (!bt_addr_le_cmp(conn_addr, &dev_info->addr)) {
+					is_connected = true;
+					break;
+				}
+			}
+		}
+		bt_addr_le_to_str(&dev_info->addr, addr, sizeof(addr));
+		printk("  %s%s (%s)\n", is_connected ? "*" : "", dev_info->name, addr);
+	}
+}
+
+static uint8_t hr_measurement[20];
+static uint16_t hr_measurement_len;
+
+static uint8_t cp_measurement[34];
+static uint16_t cp_measurement_len;
+
+static uint8_t ftms_measurement[64];
+static uint16_t ftms_measurement_len;
+
+static uint8_t ftms_training_status[20];
+static uint16_t ftms_training_status_len;
+
+static uint8_t ftms_machine_status[20];
+static uint16_t ftms_machine_status_len;
+
+/* Track power meter (CP) availability */
+static uint32_t last_cp_data_time = 0;
+#define CP_TIMEOUT_MS 5000  /* Consider CP lost after 5 seconds */
+
+static const struct bt_uuid *discover_services[] = {
+	BT_UUID_HRS,
+	BT_UUID_CPS,
+	BT_UUID_FMS,
+};
+static const int discover_service_count = ARRAY_SIZE(discover_services);
+
+uint64_t total_rx_count; /* This value is exposed to test code */
+
+BT_GATT_SERVICE_DEFINE(hr_svc,
+	BT_GATT_PRIMARY_SERVICE(BT_UUID_HRS),
+	BT_GATT_CHARACTERISTIC(BT_UUID_HRS_MEASUREMENT,
+			       BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_NONE,
+			       NULL, NULL, NULL),
+	BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+);
+
+BT_GATT_SERVICE_DEFINE(cp_svc,
+	BT_GATT_PRIMARY_SERVICE(BT_UUID_DECLARE_16(0x1818)), /* Cycling Power Service */
+	BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_16(0x2A63), /* CP Measurement */
+			       BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_NONE,
+			       NULL, NULL, NULL),
+	BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+);
+
+/* CCC configuration callback for Control Point */
+static void ftms_cp_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+	ftms_cp_indicate_enabled = (value == BT_GATT_CCC_INDICATE);
+	printk("[FTMS CP] CCC changed: indications %s\n", 
+	       ftms_cp_indicate_enabled ? "enabled" : "disabled");
+}
+
+/* Forward declare Control Point write callback */
+static ssize_t ftms_control_point_write(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+					const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
+
+BT_GATT_SERVICE_DEFINE(ftms_svc,
+	BT_GATT_PRIMARY_SERVICE(BT_UUID_DECLARE_16(0x1826)), /* Fitness Machine Service */
+	BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_16(0x2AD2), /* Indoor Bike Data */
+			       BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_NONE,
+			       NULL, NULL, NULL),
+	BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+	BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_16(0x2AD3), /* Training Status */
+			       BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_NONE,
+			       NULL, NULL, NULL),
+	BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+	BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_16(0x2ADA), /* Fitness Machine Status */
+			       BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_NONE,
+			       NULL, NULL, NULL),
+	BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+	BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_16(0x2AD9), /* Fitness Machine Control Point */
+			       BT_GATT_CHRC_WRITE | BT_GATT_CHRC_INDICATE,
+			       BT_GATT_PERM_WRITE,
+			       NULL, ftms_control_point_write, NULL),
+	BT_GATT_CCC(ftms_cp_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+);
+
+/* Indication callbacks for FTMS Control Point responses */
+static void ftms_cp_indicate_cb(struct bt_conn *conn,
+				struct bt_gatt_indicate_params *params, uint8_t err)
+{
+	if (err) {
+		printk("[FTMS CP] Indication failed (err %d)\n", err);
+	} else {
+		printk("[FTMS CP] Indication acknowledged by Zwift\n");
+	}
+}
+
+static void ftms_cp_indicate_destroy(struct bt_gatt_indicate_params *params)
+{
+	printk("[FTMS CP] Indication complete\n");
+	ftms_cp_indicating = false;
+}
+
+/* Work handler for sending Control Point responses */
+static void ftms_cp_response_work_handler(struct k_work *work)
+{
+	if (peripheral_conn && ftms_cp_indicate_enabled && !ftms_cp_indicating) {
+		/* Use Attribute 11 (Control Point Value) for indication */
+		ftms_cp_ind_params.attr = &ftms_svc.attrs[11];
+		ftms_cp_ind_params.func = ftms_cp_indicate_cb;
+		ftms_cp_ind_params.destroy = ftms_cp_indicate_destroy;
+		ftms_cp_ind_params.data = ftms_cp_response;
+		ftms_cp_ind_params.len = ftms_cp_response_len;
+		
+		int err = bt_gatt_indicate(peripheral_conn, &ftms_cp_ind_params);
+		if (err) {
+			printk("[FTMS CP] Failed to send indication (err %d)\n", err);
+		} else {
+			ftms_cp_indicating = true;
+			printk("[FTMS CP] Indication sent, waiting for ACK\n");
+		}
+	}
+}
+
+/* Buffer and params for forwarding commands to trainer */
+static uint8_t ftms_cp_write_buf[32];
+static struct bt_gatt_write_params ftms_cp_write_params;
+
+
+static void ftms_cp_write_cb(struct bt_conn *conn, uint8_t err,
+			     struct bt_gatt_write_params *params)
+{
+	if (err) {
+		printk("[FTMS CP] Forwarding to trainer failed (err %u)\n", err);
+	} else {
+		printk("[FTMS CP] Forwarding to trainer complete\n");
+	}
+}
+
+/* Control Point write callback - receives commands from Zwift */
+static ssize_t ftms_control_point_write(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+					const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
+{
+	const uint8_t *cmd = buf;
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	if (offset != 0) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+
+	if (len < 1) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	}
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	/* Log command from Zwift */
+	if (cmd[0] == FTMS_CP_SET_TARGET_RESISTANCE && len >= 2) {
+		int8_t resistance = cmd[1];
+		printk("[FTMS CP] Zwift (%s) -> %s (0x%02x), Resistance: %d\n", 
+		       addr, ftms_cp_opcode_str(cmd[0]), cmd[0], resistance);
+	} else if (cmd[0] == FTMS_CP_SET_TARGET_POWER && len >= 3) {
+		int16_t power = sys_le16_to_cpu(*(uint16_t *)&cmd[1]);
+		printk("[FTMS CP] Zwift (%s) -> %s (0x%02x), Power: %d W\n", 
+		       addr, ftms_cp_opcode_str(cmd[0]), cmd[0], power);
+	} else {
+		printk("[FTMS CP] Zwift (%s) -> %s (0x%02x)\n", 
+		       addr, ftms_cp_opcode_str(cmd[0]), cmd[0]);
+	}
+
+	/* Store peripheral connection for sending responses back */
+	if (!peripheral_conn) {
+		peripheral_conn = bt_conn_ref(conn);
+		printk("[FTMS CP] Stored peripheral connection\n");
+	}
+
+	/* Request Control is forwarded to the trainer like other commands */
+	if (cmd[0] == FTMS_CP_REQUEST_CONTROL) {
+		printk("[FTMS CP] Forwarding Request Control to trainer\n");
+	}
+
+	/* Find trainer connection with FTMS Control Point */
+	struct conn_slot *trainer_slot = NULL;
+	for (int i = 0; i < MAX_CONNECTIONS; i++) {
+		if (connections[i].conn && connections[i].ftms_control_point_handle != 0) {
+			trainer_slot = &connections[i];
+			printk("[FTMS CP] Found trainer at slot %d, handle=%u\n", i, connections[i].ftms_control_point_handle);
+			break;
+		}
+	}
+
+	if (!trainer_slot) {
+		char slots_str[64];
+		int pos = 0;
+		for (int i = 0; i < MAX_CONNECTIONS; i++) {
+			if (connections[i].conn) {
+				pos += snprintf(slots_str + pos, sizeof(slots_str) - pos, "%d:handle=%u ", i, connections[i].ftms_control_point_handle);
+			}
+		}
+		printk("[FTMS CP] ERROR: No trainer connection found (slots: %s)\n", slots_str);
+		return len; /* ACK anyway to avoid Zwift errors */
+	}
+
+	/* Forward command to trainer */
+	if (len > sizeof(ftms_cp_write_buf)) {
+		printk("[FTMS CP] Error: Command too long (%u)\n", len);
+		return len;
+	}
+
+	memcpy(ftms_cp_write_buf, cmd, len);
+			
+	ftms_cp_write_params.func = ftms_cp_write_cb;
+	ftms_cp_write_params.handle = trainer_slot->ftms_control_point_handle;
+	ftms_cp_write_params.offset = 0;
+	ftms_cp_write_params.data = ftms_cp_write_buf;
+	ftms_cp_write_params.length = len;
+
+	int err = bt_gatt_write(trainer_slot->conn, &ftms_cp_write_params);
+	if (err) {
+		printk("[FTMS CP] Write to trainer failed (err %d)\n", err);
+	} else {
+		printk("[FTMS CP] Forwarded to trainer (Write Request)\n");
+	}
+
+	return len;
+}
+
+static uint8_t notify_func(struct bt_conn *conn,
+			   struct bt_gatt_subscribe_params *params,
+			   const void *data, uint16_t length)
+{
+	if (!data) {
+		printk("[UNSUBSCRIBED] value_handle=%u\n", params->value_handle);
+		return BT_GATT_ITER_STOP;
+	}
+
+	/* Find which connection slot this notification belongs to */
+	struct conn_slot *slot = NULL;
+	int service_index = -1;
+	for (int i = 0; i < MAX_CONNECTIONS; i++) {
+		for (int j = 0; j < MAX_SUBSCRIPTIONS_PER_CONN; j++) {
+			if (connections[i].subscribe_params[j] == params) {
+				slot = &connections[i];
+				service_index = slot->service_type[j];
+				break;
+			}
+		}
+		if (slot) break;
+	}
+
+	if (!slot) {
+		printk("Notification from unknown subscription\n");
+		return BT_GATT_ITER_CONTINUE;
+	}
+
+
+
+	/* Determine service by checking stored service_type */
+	int sub_idx = -1;
+	int svc_type = -1;
+	for (int j = 0; j < MAX_SUBSCRIPTIONS_PER_CONN; j++) {
+		if (slot->subscribe_params[j] == params) {
+			sub_idx = j;
+			svc_type = slot->service_type[j];
+			break;
+		}
+	}
+
+	if (svc_type == -1) {
+		printk("Notification: service_type not found (length=%u)\n", length);
+		return BT_GATT_ITER_CONTINUE;
+	}
+
+	if (svc_type == 0) {
+		/* HR service */
+		const uint8_t *hr_data = data;
+		uint8_t flags = hr_data[0];
+		uint8_t hr_format = flags & 0x01;
+		uint16_t heart_rate;
+
+		if (length < 2) {
+			printk("Invalid HR data length: %u\n", length);
+			return BT_GATT_ITER_CONTINUE;
+		}
+
+		if (hr_format == 0) {
+			heart_rate = hr_data[1];
+		} else {
+			if (length < 3) {
+				printk("Invalid HR data length for UINT16: %u\n", length);
+				return BT_GATT_ITER_CONTINUE;
+			}
+			heart_rate = sys_le16_to_cpu(*(uint16_t *)&hr_data[1]);
+		}
+
+		/* Store and rebroadcast the HR measurement */
+		hr_measurement_len = length;
+		memcpy(hr_measurement, data, length);
+		bt_gatt_notify(NULL, &hr_svc.attrs[1], hr_measurement, hr_measurement_len);
+
+		printk("Heart Rate: %u bpm (rebroadcasted)\n", heart_rate);
+	} else if (svc_type == 1) {
+		/* CP service */
+		last_cp_data_time = k_uptime_get_32();
+		const uint8_t *cp_data = data;
+		
+		/* Parse CP Measurement according to BLE spec */
+		if (length >= 4) {
+			char cp_str[96];
+			int pos = 0;
+			uint16_t flags = sys_le16_to_cpu(*(uint16_t *)&cp_data[0]);
+			int16_t power = sys_le16_to_cpu(*(uint16_t *)&cp_data[2]);
+			
+			pos += snprintf(cp_str + pos, sizeof(cp_str) - pos, "Cycling Power: %d W, Flags: 0x%04x", power, flags);
+			
+			/* Track offset for optional fields */
+			int offset = 4;
+			
+			/* Check for Pedal Power Balance (bit 0) */
+			if (flags & 0x01) {
+				if (length > offset) {
+					uint8_t balance = cp_data[offset];
+					pos += snprintf(cp_str + pos, sizeof(cp_str) - pos, ", Balance: %u%%", balance);
+					offset++;
+				}
+			}
+			
+			/* Check for Crank Revolution Data (bit 5) */
+			if (flags & 0x20) {
+				if (length >= offset + 4) {
+					uint16_t crank_revs = sys_le16_to_cpu(*(uint16_t *)&cp_data[offset]);
+					uint16_t last_crank_time = sys_le16_to_cpu(*(uint16_t *)&cp_data[offset + 2]);
+					pos += snprintf(cp_str + pos, sizeof(cp_str) - pos, ", Crank Revs: %u, Time: %u", crank_revs, last_crank_time);
+				}
+			}
+			printk("%s (rebroadcasted)\n", cp_str);
+		}
+		
+		cp_measurement_len = length;
+		memcpy(cp_measurement, data, length);
+		bt_gatt_notify(NULL, &cp_svc.attrs[1], cp_measurement, cp_measurement_len);
+	} else if (svc_type == 2) {
+		/* FTMS Indoor Bike Data */
+		const uint8_t *ftms_data = data;
+		uint16_t flags = 0;
+		uint16_t original_flags = 0;
+		
+		/* Parse Indoor Bike Data according to FTMS spec */
+		if (length >= 2) {
+			char ftms_str[128];
+			int pos = 0;
+			flags = sys_le16_to_cpu(*(uint16_t *)&ftms_data[0]);
+			original_flags = flags;
+			int offset = 2;
+			
+			/* Check if power meter is active */
+			uint32_t now = k_uptime_get_32();
+			bool cp_active = (last_cp_data_time != 0 && (now - last_cp_data_time) < CP_TIMEOUT_MS);
+			bool cp_was_active = (last_cp_data_time != 0);
+			
+			/* If CP is active, clear cadence bit to force Zwift to use CP cadence */
+			if (cp_active && (flags & 0x0004)) {
+				flags &= ~0x0004;  /* Clear bit 2 (Instantaneous Cadence) */
+			}
+			
+			pos += snprintf(ftms_str + pos, sizeof(ftms_str) - pos, "FTMS Indoor Bike: Flags=0x%04x", flags);
+			
+			/* Instantaneous Speed (MANDATORY - always present) - UINT16, km/h */
+			if (length >= offset + 2) {
+				uint16_t speed = sys_le16_to_cpu(*(uint16_t *)&ftms_data[offset]);
+				pos += snprintf(ftms_str + pos, sizeof(ftms_str) - pos, ", Speed=%u km/h", speed);
+			}
+			offset += 2;
+			
+			/* Average Speed (bit 1) - UINT16, 0.01 km/h */
+			if (flags & 0x0002) {
+				offset += 2;
+			}
+			
+			/* Instantaneous Cadence (bit 2) - UINT16, 0.5 rpm */
+			if (flags & 0x0004) {
+				if (length >= offset + 2) {
+					uint16_t cadence = sys_le16_to_cpu(*(uint16_t *)&ftms_data[offset]);
+					pos += snprintf(ftms_str + pos, sizeof(ftms_str) - pos, ", Cadence=%u.%u rpm", cadence / 2, (cadence % 2) * 5);
+				}
+				offset += 2;
+			}
+			
+			/* Average Cadence (bit 3) - UINT16, 0.5 rpm */
+			if (flags & 0x0008) {
+				offset += 2;
+			}
+			
+			/* Total Distance (bit 4) - UINT24, 1 meter */
+			if (flags & 0x0010) {
+				offset += 3;
+			}
+			
+			/* Resistance Level (bit 5) - SINT16, unitless */
+			if (flags & 0x0020) {
+				if (length >= offset + 2) {
+					int16_t resistance = sys_le16_to_cpu(*(uint16_t *)&ftms_data[offset]);
+					pos += snprintf(ftms_str + pos, sizeof(ftms_str) - pos, ", Resistance=%d", resistance);
+				}
+				offset += 2;
+			}
+			
+			/* Instantaneous Power (bit 6) - SINT16, 1 watt */
+			int16_t ftms_power = -1;
+			if (original_flags & 0x0040) {
+				if (length >= offset + 2) {
+					ftms_power = sys_le16_to_cpu(*(uint16_t *)&ftms_data[offset]);
+					pos += snprintf(ftms_str + pos, sizeof(ftms_str) - pos, ", Power=%d W", ftms_power);
+				}
+				offset += 2;
+			}
+			
+			if (cp_active && (original_flags != flags)) {
+				printk("%s [Cadence hidden - using CP cadence] (rebroadcasted)\n", ftms_str);
+			} else {
+				printk("%s (rebroadcasted)\n", ftms_str);
+			}
+			
+			/* Synthesize CP measurement if power meter lost but FTMS has power */
+			if (!cp_active && cp_was_active && ftms_power >= 0) {
+				/* Create minimal CP measurement with just power */
+				uint8_t synthetic_cp[4];
+				synthetic_cp[0] = 0x00;  /* Flags LSB - no optional fields */
+				synthetic_cp[1] = 0x00;  /* Flags MSB */
+				memcpy(&synthetic_cp[2], &ftms_power, 2);  /* Power in watts */
+				
+				bt_gatt_notify(NULL, &cp_svc.attrs[1], synthetic_cp, 4);
+				printk("[CP SYNTHESIZED] Power: %d W (from FTMS)\n", ftms_power);
+			}
+		}
+		
+		/* Rebroadcast FTMS with potentially modified flags */
+		if (flags != original_flags) {
+			/* Flags were modified, need to copy and update */
+			ftms_measurement_len = length;
+			memcpy(ftms_measurement, data, length);
+			/* Update flags in the copy */
+			uint16_t flags_le = sys_cpu_to_le16(flags);
+			memcpy(ftms_measurement, &flags_le, 2);
+			bt_gatt_notify(NULL, &ftms_svc.attrs[1], ftms_measurement, ftms_measurement_len);
+		} else {
+			/* No modification, broadcast as-is */
+			ftms_measurement_len = length;
+			memcpy(ftms_measurement, data, length);
+			bt_gatt_notify(NULL, &ftms_svc.attrs[1], ftms_measurement, ftms_measurement_len);
+		}
+	} else if (svc_type == 3) {
+		/* FTMS Training Status (0x2AD3) */
+		printk("FTMS Training Status [%u bytes] (rebroadcasted)\n", length);
+		ftms_training_status_len = length;
+		memcpy(ftms_training_status, data, length);
+		bt_gatt_notify(NULL, &ftms_svc.attrs[3], ftms_training_status, ftms_training_status_len);
+	} else if (svc_type == 4) {
+		/* FTMS Fitness Machine Status (0x2ADA) */
+		const uint8_t *status_data = data;
+		if (length >= 1) {
+			uint8_t op_code = status_data[0];
+			char status_str[128];
+			int pos = 0;
+			
+			pos += snprintf(status_str + pos, sizeof(status_str) - pos, "FTMS Machine Status: ");
+			
+			switch (op_code) {
+			case 0x01:
+				pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Reset");
+				break;
+			case 0x02:
+				pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Stopped/Paused by User");
+				break;
+			case 0x03:
+				pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Stopped by Safety Key");
+				break;
+			case 0x04:
+				pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Started/Resumed by User");
+				break;
+			case 0x05:
+				if (length >= 3) {
+					uint16_t speed = sys_le16_to_cpu(*(uint16_t *)&status_data[1]);
+					pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Target Speed Changed: %u.%02u km/h", speed / 100, speed % 100);
+				} else {
+					pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Target Speed Changed");
+				}
+				break;
+			case 0x06:
+				if (length >= 3) {
+					int16_t incline = sys_le16_to_cpu(*(uint16_t *)&status_data[1]);
+					pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Target Incline Changed: %d.%d%%", incline / 10, abs(incline % 10));
+				} else {
+					pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Target Incline Changed");
+				}
+				break;
+			case 0x07:
+				if (length >= 2) {
+					int8_t resistance = status_data[1];
+					pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Target Resistance Changed: %d", resistance);
+				} else {
+					pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Target Resistance Changed");
+				}
+				break;
+			case 0x08:
+				if (length >= 3) {
+					int16_t power = sys_le16_to_cpu(*(uint16_t *)&status_data[1]);
+					pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Target Power Changed: %d W", power);
+				} else {
+					pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Target Power Changed");
+				}
+				break;
+			case 0x09:
+				if (length >= 2) {
+					uint8_t hr = status_data[1];
+					pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Target HR Changed: %u bpm", hr);
+				} else {
+					pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Target HR Changed");
+				}
+				break;
+			case 0x0D:
+				pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Indoor Bike Simulation Parameters Changed");
+				break;
+			case 0x12:
+				pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Control Permission Lost");
+				break;
+			case 0x81:
+				pos += snprintf(status_str + pos, sizeof(status_str) - pos, "**ERROR: Spin Down Required**");
+				break;
+			case 0x82:
+				pos += snprintf(status_str + pos, sizeof(status_str) - pos, "**ERROR: Calibration Required**");
+				break;
+			case 0x83:
+				pos += snprintf(status_str + pos, sizeof(status_str) - pos, "**ERROR: Temperature Too High**");
+				if (length >= 2) {
+					uint8_t temp = status_data[1];
+					pos += snprintf(status_str + pos, sizeof(status_str) - pos, " (%u°C)", temp);
+				}
+				break;
+			case 0x84:
+				pos += snprintf(status_str + pos, sizeof(status_str) - pos, "**ERROR: Temperature Too Low**");
+				if (length >= 2) {
+					uint8_t temp = status_data[1];
+					pos += snprintf(status_str + pos, sizeof(status_str) - pos, " (%u°C)", temp);
+				}
+				break;
+			default:
+				pos += snprintf(status_str + pos, sizeof(status_str) - pos, "Unknown OpCode 0x%02x", op_code);
+				if (length > 1) {
+					pos += snprintf(status_str + pos, sizeof(status_str) - pos, " [");
+					for (int i = 1; i < length && pos < sizeof(status_str) - 8; i++) {
+						pos += snprintf(status_str + pos, sizeof(status_str) - pos, "%02x ", status_data[i]);
+					}
+					pos += snprintf(status_str + pos, sizeof(status_str) - pos, "]");
+				}
+				break;
+			}
+			
+			printk("%s (rebroadcasted)\n", status_str);
+		} else {
+			printk("FTMS Machine Status [%u bytes] (rebroadcasted)\n", length);
+		}
+		
+		ftms_machine_status_len = length;
+		memcpy(ftms_machine_status, data, length);
+		bt_gatt_notify(NULL, &ftms_svc.attrs[5], ftms_machine_status, ftms_machine_status_len);
+	}
+
+	total_rx_count++;
+
+	return BT_GATT_ITER_CONTINUE;
+}
+
+/* Indication callback - receives Control Point responses from trainer */
+static uint8_t ftms_cp_indicate_func(struct bt_conn *conn,
+				     struct bt_gatt_subscribe_params *params,
+				     const void *data, uint16_t length)
+{
+	if (!data) {
+		printk("[FTMS CP] Indication unsubscribed\n");
+		params->value_handle = 0U;
+		return BT_GATT_ITER_STOP;
+	}
+
+	const uint8_t *response = data;
+
+	/* Log trainer response */
+	char hex_str[64];
+	int pos = 0;
+	for (int i = 0; i < length && pos < sizeof(hex_str) - 3; i++) {
+		pos += snprintf(hex_str + pos, sizeof(hex_str) - pos, "%02x ", response[i]);
+	}
+	printk("[FTMS CP] Trainer response [%u bytes]: %s\n", length, hex_str);
+
+	if (length >= 3 && response[0] == FTMS_CP_RESPONSE_CODE) {
+		uint8_t req_opcode = response[1];
+		uint8_t result = response[2];
+		printk("[FTMS CP] Response to %s: %s\n",
+		       ftms_cp_opcode_str(req_opcode),
+		       result == 0x01 ? "Success" : result == 0x02 ? "Not Supported" :
+		       result == 0x03 ? "Invalid Parameter" : result == 0x04 ? "Failed" : "Unknown");
+	}
+
+	/* Forward indication back to Zwift if connected */
+	if (peripheral_conn && ftms_cp_indicate_enabled) {
+		if (length > sizeof(ftms_cp_response)) {
+			printk("[FTMS CP] Response too long (%u), truncating\n", length);
+			length = sizeof(ftms_cp_response);
+		}
+		ftms_cp_response_len = length;
+		memcpy(ftms_cp_response, data, length);
+		
+		/* Schedule work to send indication */
+		k_work_submit(&ftms_cp_response_work);
+		printk("[FTMS CP] Queued response for forwarding\n");
+	} else if (peripheral_conn && !ftms_cp_indicate_enabled) {
+		printk("[FTMS CP] Cannot send indication - CCC not configured\n");
+	}
+
+	return BT_GATT_ITER_CONTINUE;
+}
+
+static uint8_t discover_func(struct bt_conn *conn,
+			     const struct bt_gatt_attr *attr,
+			     struct bt_gatt_discover_params *params)
+{
+	int err;
+
+	/* Find which connection slot this discovery belongs to */
+	struct conn_slot *slot = NULL;
+	for (int i = 0; i < MAX_CONNECTIONS; i++) {
+		if (params == &connections[i].discover_params) {
+			slot = &connections[i];
+			break;
+		}
+	}
+
+	if (!slot) {
+		printk("Discovery from unknown connection\n");
+		return BT_GATT_ITER_STOP;
+	}
+
+	if (!attr) {
+		printk("Discover complete for service %d\n", slot->discover_service_index);
+		(void)memset(params, 0, sizeof(*params));
+		slot->discover_params.func = discover_func;
+		slot->discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+
+		/* proceed to next service if queued */
+		if (slot->discover_service_index < discover_service_count - 1) {
+			slot->discover_service_index++;
+			memcpy(&slot->discover_uuid, discover_services[slot->discover_service_index], sizeof(slot->discover_uuid));
+			slot->discover_params.uuid = &slot->discover_uuid.uuid;
+			slot->discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+			slot->discover_params.type = BT_GATT_DISCOVER_PRIMARY;
+			err = bt_gatt_discover(conn, &slot->discover_params);
+			if (err) {
+				printk("Discover failed (err %d)\n", err);
+			}
+		} else {
+			start_scan();
+		}
+
+		return BT_GATT_ITER_STOP;
+	}
+
+	printk("[ATTRIBUTE] handle %u\n", attr->handle);
+
+	if (params->type == BT_GATT_DISCOVER_PRIMARY) {
+		/* Discover characteristics for this service */
+		slot->discover_params.start_handle = attr->handle + 1;
+		slot->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+		slot->discover_params.uuid = NULL;
+
+		err = bt_gatt_discover(conn, &slot->discover_params);
+		if (err) {
+			printk("Discover failed (err %d)\n", err);
+		}
+	} else if (params->type == BT_GATT_DISCOVER_CHARACTERISTIC) {
+		/* Check if this is Control Point characteristic (0x2AD9) for FTMS */
+		const struct bt_gatt_chrc *chrc = attr->user_data;
+		uint16_t char_uuid = BT_UUID_16(chrc->uuid)->val;
+		
+		/* Debug: log characteristic UUID and properties */
+		if (slot->discover_service_index == 2) {
+			printk("[FTMS] Found characteristic UUID 0x%04x, properties 0x%02x at handle %u\n", 
+			       char_uuid, chrc->properties, attr->handle);
+		}
+		
+		if (slot->discover_service_index == 2 && char_uuid == 0x2AD9) {
+			/* Found FTMS Control Point - store handle for writing */
+			slot->ftms_control_point_handle = bt_gatt_attr_value_handle(attr);
+			printk("[FTMS CP] Control Point handle: %u\n", slot->ftms_control_point_handle);
+			
+			/* Get next slot from ring buffer */
+			int idx = slot->subscribe_count;
+			int ring_slot = next_subscribe_slot;
+			next_subscribe_slot = (next_subscribe_slot + 1) % SUBSCRIPTION_RING_BUFFER_SIZE;
+			
+			struct bt_gatt_subscribe_params *sp = &subscribe_ring_buffer[ring_slot];
+			memset(sp, 0, sizeof(*sp));
+			sp->notify = ftms_cp_indicate_func;
+			sp->value = BT_GATT_CCC_INDICATE;
+			sp->value_handle = slot->ftms_control_point_handle;
+			sp->ccc_handle = attr->handle + 2; /* CCC is typically +2 from char declaration */
+			
+			slot->subscribe_params[idx] = sp;
+			slot->service_type[idx] = slot->discover_service_index;
+			
+			err = bt_gatt_subscribe(conn, sp);
+			if (err && err != -EALREADY) {
+				printk("[FTMS CP] Subscribe to indications failed (err %d)\n", err);
+			} else {
+				printk("[FTMS CP] Subscribed to indications\n");
+				slot->subscribe_count++;
+			}
+			
+			/* Continue discovering other characteristics */
+			slot->discover_params.start_handle = attr->handle + 1;
+			slot->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+			slot->discover_params.uuid = NULL;
+			err = bt_gatt_discover(conn, &slot->discover_params);
+			if (err) {
+				printk("Discover failed (err %d)\n", err);
+			}
+			return BT_GATT_ITER_STOP;
+		}
+		
+		/* Check if characteristic supports notify/indicate before subscribing */
+		if (!(chrc->properties & (BT_GATT_CHRC_NOTIFY | BT_GATT_CHRC_INDICATE))) {
+			/* This characteristic doesn't support notifications, skip it */
+			printk("[SKIP] Characteristic 0x%04x has no notify/indicate\n", char_uuid);
+			slot->discover_params.start_handle = attr->handle + 1;
+			// ...existing code...
+			err = bt_gatt_discover(conn, &slot->discover_params);
+			if (err) {
+				printk("Discover failed (err %d)\n", err);
+				start_scan();
+			}
+			return BT_GATT_ITER_STOP;
+		}
+
+		/* If we are looking for Heart Rate (Index 0), prioritize HR Measurement (0x2A37) */
+		if (slot->discover_service_index == 0 && char_uuid != 0x2A37) {
+			printk("[SKIP] Skipping Char 0x%04x in HR Service (looking for 0x2A37)\n", char_uuid);
+			slot->discover_params.start_handle = attr->handle + 1;
+			slot->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+			slot->discover_params.uuid = NULL;
+			err = bt_gatt_discover(conn, &slot->discover_params);
+			if (err) {
+				printk("Discover failed (err %d)\n", err);
+				start_scan();
+			}
+			return BT_GATT_ITER_STOP;
+		}
+		
+		/* Found a characteristic with notify/indicate, discover its CCC descriptor */
+		memcpy(&slot->discover_uuid, BT_UUID_GATT_CCC, sizeof(slot->discover_uuid));
+		slot->discover_params.uuid = &slot->discover_uuid.uuid;
+		slot->discover_params.start_handle = attr->handle + 2;
+		slot->discover_params.type = BT_GATT_DISCOVER_DESCRIPTOR;
+		
+		/* Store value_handle temporarily - don't allocate ring buffer yet! */
+		slot->temp_value_handle = bt_gatt_attr_value_handle(attr);
+
+		err = bt_gatt_discover(conn, &slot->discover_params);
+		if (err) {
+			printk("Discover failed (err %d)\n", err);
+		}
+	} else {
+		/* Found CCC descriptor, now allocate ring buffer slot and subscribe */
+		int idx = slot->subscribe_count;
+		
+		/* Allocate next slot from ring buffer NOW (not during char discovery) */
+		int ring_slot = next_subscribe_slot;
+		next_subscribe_slot = (next_subscribe_slot + 1) % SUBSCRIPTION_RING_BUFFER_SIZE;
+		
+		struct bt_gatt_subscribe_params *sp = &subscribe_ring_buffer[ring_slot];
+		slot->subscribe_params[idx] = sp;
+		
+		/* Clear the structure to ensure no stale data */
+		memset(sp, 0, sizeof(*sp));
+		
+		sp->notify = notify_func;
+		sp->value = BT_GATT_CCC_NOTIFY;
+		sp->ccc_handle = attr->handle;
+		/* Get value_handle from temporary storage */
+		sp->value_handle = slot->temp_value_handle;
+
+		/* Store which service this subscription is for */
+		slot->service_type[idx] = slot->discover_service_index;
+
+		err = bt_gatt_subscribe(conn, sp);
+		if (err && err != -EALREADY) {
+			printk("Subscribe failed (err %d)\n", err);
+		} else {
+			printk("[SUBSCRIBED] service %d (slot %d, sub_idx %d)\n", 
+			       slot->discover_service_index, (int)(slot - connections), slot->subscribe_count);
+			slot->subscribe_count++;
+		}
+
+		/* For FTMS (service 2), continue discovering more characteristics (Control Point, etc.) */
+		if (slot->discover_service_index == 2) {
+			slot->discover_params.start_handle = attr->handle + 1;
+			slot->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+			slot->discover_params.uuid = NULL;
+
+			err = bt_gatt_discover(conn, &slot->discover_params);
+			if (err) {
+				printk("Discover failed (err %d)\n", err);
+			}
+		} else if (slot->discover_service_index < discover_service_count - 1) {
+			/* For HR/CP services, move to next service */
+			slot->discover_service_index++;
+			const char *svc_names[] = {"HRS", "CPS", "FTMS"};
+			printk("Switching discovery to service %s (Index %d)\n", 
+			       svc_names[slot->discover_service_index], slot->discover_service_index);
+			
+			memcpy(&slot->discover_uuid, discover_services[slot->discover_service_index], 
+			       sizeof(slot->discover_uuid));
+			slot->discover_params.uuid = &slot->discover_uuid.uuid;
+			slot->discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+			slot->discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+			slot->discover_params.type = BT_GATT_DISCOVER_PRIMARY;
+			slot->discover_params.func = discover_func;
+			
+			err = bt_gatt_discover(conn, &slot->discover_params);
+			if (err) {
+				printk("Discover failed (err %d)\n", err);
+				start_scan();
+			}
+		} else {
+			/* All services discovered */
+			printk("Discover complete for all services\n");
+			start_scan();
+		}
+
+		return BT_GATT_ITER_STOP;
+	}
+
+	return BT_GATT_ITER_STOP;
+}
+
+/* Connection timeout work */
+static struct k_work_delayable conn_timeout_work;
+static struct bt_conn *pending_conn = NULL;
+
+static void conn_timeout_handler(struct k_work *work)
+{
+	if (pending_conn) {
+		char addr[BT_ADDR_LE_STR_LEN];
+		bt_addr_le_to_str(bt_conn_get_dst(pending_conn), addr, sizeof(addr));
+		printk("Connection timeout to %s, cancelling...\n", addr);
+		
+		int err = bt_conn_disconnect(pending_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		if (err) {
+			printk("Failed to cancel connection (err %d)\n", err);
+			/* Force cleanup of pending_conn reference if disconnect fails */
+			bt_conn_unref(pending_conn);
+			pending_conn = NULL;
+			start_scan();
+		}
+		/* disconnected callback will handle the rest (unref, start_scan) if disconnect succeeds */
+	}
+}
+
+static bool eir_found(struct bt_data *data, void *user_data)
+{
+	/* user_data is a pointer to a parse context provided by device_found */
+	struct {
+		const bt_addr_le_t *addr;
+		char name[32];
+		uint8_t svc_mask;
+	} *ctx = user_data;
+
+	int i;
+
+	switch (data->type) {
+	case BT_DATA_UUID16_SOME:
+	case BT_DATA_UUID16_ALL:
+		if (data->data_len % sizeof(uint16_t) != 0U) {
+			return true;
+		}
+
+		for (i = 0; i < data->data_len; i += sizeof(uint16_t)) {
+			uint16_t u16;
+			memcpy(&u16, &data->data[i], sizeof(u16));
+			const struct bt_uuid *uuid = BT_UUID_DECLARE_16(sys_le16_to_cpu(u16));
+
+			if (!bt_uuid_cmp(uuid, BT_UUID_HRS)) {
+				ctx->svc_mask |= 0x01; /* HRS */
+			} else if (!bt_uuid_cmp(uuid, BT_UUID_DECLARE_16(0x1818))) {
+				ctx->svc_mask |= 0x02; /* CPS */
+			} else if (!bt_uuid_cmp(uuid, BT_UUID_DECLARE_16(0x1826))) {
+				ctx->svc_mask |= 0x04; /* FTMS */
+			}
+		}
+		break;
+	case BT_DATA_NAME_COMPLETE:
+	case BT_DATA_NAME_SHORTENED:
+		{
+			size_t len = data->data_len < sizeof(ctx->name) - 1 ? data->data_len : sizeof(ctx->name) - 1;
+			memcpy(ctx->name, data->data, len);
+			ctx->name[len] = '\0';
+		}
+		break;
+	default:
+		break;
+	}
+
+	return true;
+}
+
+static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
+			 struct net_buf_simple *ad)
+{
+	char dev[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(addr, dev, sizeof(dev));
+
+	/* Parse advertising data into a temporary context (name + svc mask) */
+	struct {
+		const bt_addr_le_t *addr;
+		char name[32];
+		uint8_t svc_mask;
+	} parse_ctx;
+	parse_ctx.addr = addr;
+	parse_ctx.name[0] = '\0';
+	parse_ctx.svc_mask = 0;
+
+	bt_data_parse(ad, eir_found, &parse_ctx);
+
+	uint32_t now = k_uptime_get_32();
+
+	// Find if device exists
+	struct device_info *dev_info = NULL;
+	struct device_info *iter;
+	bool found = false;
+	SYS_SLIST_FOR_EACH_CONTAINER(&device_list, iter, node) {
+		if (!bt_addr_le_cmp(&iter->addr, addr)) {
+			dev_info = iter;
+			found = true;
+			break;
+		}
+	}
+
+	if (found && dev_info) {
+		// Update existing device
+		if (parse_ctx.name[0] != '\0' && strcmp(dev_info->name, parse_ctx.name) != 0) {
+			bool was_address = (strcmp(dev_info->name, dev) == 0);
+			strncpy(dev_info->name, parse_ctx.name, sizeof(dev_info->name) - 1);
+			dev_info->name[sizeof(dev_info->name) - 1] = '\0';
+			if (was_address) {
+				printk("Captured name for device: %s (%s)\n", dev_info->name, dev);
+			}
+		}
+		dev_info->last_seen = now;
+		/* merge service mask seen in this advertisement */
+		dev_info->svc_mask |= parse_ctx.svc_mask;
+	} else if (!found) {
+		// Add new device
+		dev_info = k_malloc(sizeof(struct device_info));
+		if (dev_info) {
+			memcpy(&dev_info->addr, addr, sizeof(bt_addr_le_t));
+			if (parse_ctx.name[0] != '\0') {
+				strncpy(dev_info->name, parse_ctx.name, sizeof(dev_info->name) - 1);
+				dev_info->name[sizeof(dev_info->name) - 1] = '\0';
+			} else {
+				strncpy(dev_info->name, dev, sizeof(dev_info->name) - 1);
+				dev_info->name[sizeof(dev_info->name) - 1] = '\0';
+			}
+			dev_info->svc_mask = parse_ctx.svc_mask;
+			dev_info->last_seen = now;
+			dev_info->was_connected = false;
+			sys_slist_append(&device_list, &dev_info->node);
+			printk("Added device: %s\n", dev_info->name);
+			print_device_list();
+		} else {
+			printk("ERROR: Failed to allocate memory for device %s\n", dev);
+			return; // No point continuing without dev_info
+		}
+	} else {
+		printk("ERROR: found=true but dev_info=NULL for %s\n", dev);
+		return;
+	}
+
+	/* If we know this device has HR/CP service and we have its name,
+	 * attempt connection if we have a free slot. */
+	if (dev_info && dev_info->svc_mask != 0 && 
+	    dev_info->name[0] != '\0' && strcmp(dev_info->name, dev) != 0) {
+		/* Check if already connected to this device */
+		bool already_connected = false;
+		for (int i = 0; i < MAX_CONNECTIONS; i++) {
+			if (connections[i].conn) {
+				const bt_addr_le_t *conn_addr = bt_conn_get_dst(connections[i].conn);
+				if (!bt_addr_le_cmp(conn_addr, addr)) {
+					already_connected = true;
+					break;
+				}
+			}
+		}
+
+		if (!already_connected) {
+			/* Find free connection slot */
+			int free_slot = -1;
+			for (int i = 0; i < MAX_CONNECTIONS; i++) {
+				if (!connections[i].conn) {
+					free_slot = i;
+					break;
+				}
+			}
+
+			if (free_slot >= 0) {
+				struct bt_le_conn_param *param = BT_LE_CONN_PARAM_DEFAULT;
+				int err;
+
+				err = bt_le_scan_stop();
+				if (err) {
+					printk("Stop LE scan failed (err %d)\n", err);
+				} else {
+					printk("Creating connection to %s (slot %d)\n", dev_info->name, free_slot);
+					/* Use local variable for create_param to ensure correct values */
+					struct bt_conn_le_create_param create_param = *BT_CONN_LE_CREATE_CONN;
+					create_param.options = 0; /* non-Coded PHY */
+					
+					err = bt_conn_le_create(&dev_info->addr, &create_param, param, &connections[free_slot].conn);
+					if (err) {
+						printk("Create connection failed (err %d)\n", err);
+						connections[free_slot].conn = NULL;
+						start_scan();
+					} else {
+						/* Connection initiation started successfully */
+						pending_conn = bt_conn_ref(connections[free_slot].conn);
+						k_work_schedule(&conn_timeout_work, K_SECONDS(10));
+					}
+					/* Do not restart scan here - wait for connection to complete
+					 * scanning while initiating connection often fails on some controllers
+					 */
+				}
+			}
+		}
+	}
+
+	// Clean up old devices (but keep connected devices)
+	struct device_info *next;
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&device_list, dev_info, next, node) {
+		/* Check if device is connected */
+		bool is_connected = false;
+		for (int i = 0; i < MAX_CONNECTIONS; i++) {
+			if (connections[i].conn) {
+				const bt_addr_le_t *conn_addr = bt_conn_get_dst(connections[i].conn);
+				if (!bt_addr_le_cmp(conn_addr, &dev_info->addr)) {
+					is_connected = true;
+					/* Update last_seen for connected devices so they never timeout */
+					dev_info->last_seen = now;
+					break;
+				}
+			}
+		}
+		
+		/* Remove devices not seen in 10 seconds, unless connected or was connected */
+		if (now - dev_info->last_seen > 10000) {
+			if (!is_connected && !dev_info->was_connected) {
+				printk("Removed device: %s\n", dev_info->name);
+				print_device_list();
+				sys_slist_find_and_remove(&device_list, &dev_info->node);
+				k_free(dev_info);
+			}
+		}
+	}
+}
+
+static void start_scan(void)
+{
+	int err;
+
+	/* Use active scanning and disable duplicate filtering to handle any
+	 * devices that might update their advertising data at runtime. */
+	struct bt_le_scan_param scan_param = {
+		.type       = BT_LE_SCAN_TYPE_ACTIVE,
+		.options    = BT_LE_SCAN_OPT_CODED,
+		.interval   = BT_GAP_SCAN_FAST_INTERVAL,
+		.window     = BT_GAP_SCAN_FAST_WINDOW,
+	};
+
+	err = bt_le_scan_start(&scan_param, device_found);
+	if (err) {
+		if (err == -EALREADY) {
+			/* Scan already running, that's fine */
+			return;
+		}
+		printk("Scanning with Coded PHY support failed (err %d)\n", err);
+
+		printk("Scanning without Coded PHY\n");
+		scan_param.options &= ~BT_LE_SCAN_OPT_CODED;
+		err = bt_le_scan_start(&scan_param, device_found);
+		if (err && err != -EALREADY) {
+			printk("Scanning failed to start (err %d)\n", err);
+			return;
+		}
+	}
+
+	printk("Scanning successfully started\n");
+}
+
+static void start_advertising(void)
+{
+	int err;
+	const struct bt_data ad[] = {
+		BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+		BT_DATA_BYTES(BT_DATA_UUID16_ALL,
+			BT_BYTES_LIST_LE16(BT_UUID_HRS_VAL),
+			BT_BYTES_LIST_LE16(0x1818), /* Cycling Power Service */
+			BT_BYTES_LIST_LE16(0x1826)), /* Fitness Machine Service */
+		BT_DATA(BT_DATA_NAME_COMPLETE, "HR Relay", sizeof("HR Relay") - 1),
+	};
+
+	struct bt_le_adv_param adv_param = {
+		.options = BT_LE_ADV_OPT_CONN,
+		.interval_min = BT_GAP_ADV_FAST_INT_MIN_1,
+		.interval_max = BT_GAP_ADV_FAST_INT_MAX_1,
+	};
+
+	err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0);
+	if (err) {
+		printk("Advertising failed to start (err %d)\n", err);
+		return;
+	}
+
+	printk("Advertising as 'HR Relay' started\n");
+}
+
+static void connected(struct bt_conn *conn, uint8_t conn_err)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+	int err;
+	struct device_info *dev_info;
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	/* Find the connection slot */
+	struct conn_slot *slot = NULL;
+	for (int i = 0; i < MAX_CONNECTIONS; i++) {
+		if (connections[i].conn == conn) {
+			slot = &connections[i];
+			break;
+		}
+	}
+
+	if (!slot) {
+		printk("Connected but no slot found: %s\n", addr);
+		return;
+	}
+
+	if (conn_err) {
+		printk("Failed to connect to %s (%u)\n", addr, conn_err);
+		
+		/* Cancel timeout if this was the pending connection */
+		if (pending_conn && pending_conn == conn) {
+			k_work_cancel_delayable(&conn_timeout_work);
+			bt_conn_unref(pending_conn);
+			pending_conn = NULL;
+		}
+		
+		bt_conn_unref(slot->conn);
+		slot->conn = NULL;
+		start_scan();
+		return;
+	}
+
+	printk("Connected: %s\n", addr);
+	print_device_list();
+	
+	/* Connection successful, cancel timeout and clear pending */
+	if (pending_conn) {
+		if (pending_conn == conn) {
+			k_work_cancel_delayable(&conn_timeout_work);
+			bt_conn_unref(pending_conn);
+			pending_conn = NULL;
+		} else {
+			/* Should not happen if we serialized connections */
+			printk("WARNING: Connected to unexpected device? (pending %p, connected %p)\n", pending_conn, conn);
+		}
+	}
+	SYS_SLIST_FOR_EACH_CONTAINER(&device_list, dev_info, node) {
+		if (!bt_addr_le_cmp(&dev_info->addr, bt_conn_get_dst(conn))) {
+			dev_info->was_connected = true;
+			break;
+		}
+	}
+
+	/* Initialize discovery for this connection slot */
+	slot->subscribe_count = 0;
+	slot->discover_service_index = 0;
+
+	memcpy(&slot->discover_uuid, discover_services[0], sizeof(slot->discover_uuid));
+	slot->discover_params.uuid = &slot->discover_uuid.uuid;
+	slot->discover_params.func = discover_func;
+	slot->discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+	slot->discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+	slot->discover_params.type = BT_GATT_DISCOVER_PRIMARY;
+
+	err = bt_gatt_discover(conn, &slot->discover_params);
+	if (err) {
+		printk("Discover failed(err %d)\n", err);
+		/* If discovery fails to start, we must resume scanning or we'll get stuck */
+		start_scan();
+	}
+}
+
+static void disconnected(struct bt_conn *conn, uint8_t reason)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	printk("Disconnected: %s, reason 0x%02x %s\n", addr, reason, bt_hci_err_to_str(reason));
+
+	/* Remove device from list so it can be cleanly re-discovered and re-connected */
+	struct device_info *dev_info, *tmp;
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&device_list, dev_info, tmp, node) {
+		if (!bt_addr_le_cmp(&dev_info->addr, bt_conn_get_dst(conn))) {
+			printk("Removed device from list: %s\n", dev_info->name);
+			sys_slist_find_and_remove(&device_list, &dev_info->node);
+			k_free(dev_info);
+			print_device_list();
+			break;
+		}
+	}
+
+	/* Check if this was the pending connection (e.g. cancelled by timeout) */
+	if (pending_conn && pending_conn == conn) {
+		k_work_cancel_delayable(&conn_timeout_work);
+		bt_conn_unref(pending_conn);
+		pending_conn = NULL;
+	}
+
+	/* Find and clear the connection slot (central role - sensors we connected to) */
+	bool found_slot = false;
+	for (int i = 0; i < MAX_CONNECTIONS; i++) {
+		if (connections[i].conn == conn) {
+			printk("Clearing %d subscriptions for slot %d\n", 
+			       connections[i].subscribe_count, i);
+			
+			/* Clear the ring buffer slots used by this connection */
+			for (int j = 0; j < connections[i].subscribe_count; j++) {
+				if (connections[i].subscribe_params[j]) {
+					memset(connections[i].subscribe_params[j], 0, 
+					       sizeof(struct bt_gatt_subscribe_params));
+				}
+			}
+			
+			bt_conn_unref(connections[i].conn);
+			/* Explicitly zero the entire structure to ensure clean state */
+			memset(&connections[i], 0, sizeof(struct conn_slot));
+			printk("Freed connection slot %d\n", i);
+			found_slot = true;
+			break;
+		}
+	}
+
+	if (found_slot) {
+		/* Sensor disconnected, restart scanning */
+		start_scan();
+	} else {
+		/* Peripheral connection disconnected (e.g., Zwift Companion), restart advertising */
+		printk("Peripheral disconnected, restarting advertising\n");
+		
+		/* Clear peripheral connection reference */
+		if (peripheral_conn == conn) {
+			bt_conn_unref(peripheral_conn);
+			peripheral_conn = NULL;
+			printk("[FTMS CP] Cleared peripheral connection\n");
+		}
+		
+		start_advertising();
+	}
+}
+
+BT_CONN_CB_DEFINE(conn_callbacks) = {
+	.connected = connected,
+	.disconnected = disconnected,
+};
+
+int main(void)
+{
+	int err;
+
+	err = bt_enable(NULL);
+
+	if (err) {
+		printk("Bluetooth init failed (err %d)\n", err);
+		return 0;
+	}
+
+	sys_slist_init(&device_list);
+
+	/* Initialize connection timeout work */
+	k_work_init_delayable(&conn_timeout_work, conn_timeout_handler);
+
+	/* Initialize FTMS Control Point response work */
+	k_work_init(&ftms_cp_response_work, ftms_cp_response_work_handler);
+
+	/* Print initial device list */
+	print_device_list();
+
+	printk("Central HR Sample Version %s\n", VERSION);
+
+	bt_set_name("HR Relay");
+	printk("Bluetooth initialized as 'HR Relay'\n");
+
+	start_advertising();
+	start_scan();
+	return 0;
+}

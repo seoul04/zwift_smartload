@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  z_relay_server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: sechoir.meunier8.com:5000/z_relay_server:latest
+    container_name: z_relay_server
+    restart: unless-stopped
+    
+    # Serial port access (adjust device path as needed)
+    devices:
+      - /dev/ttyACM0:/dev/ttyACM0
+    
+    # Port mapping
+    ports:
+      - "5000:5000"
+    
+    # Volume mounts for config and logs
+    volumes:
+      - ../config.conf:/app/config.conf:ro
+      - ../logs:/app/logs
+    
+    # Environment variables (optional, can override config.conf settings)
+    environment:
+      - PYTHONUNBUFFERED=1
+    
+    # Network mode (optional - use host network if you need direct device access)
+    # network_mode: host
+    
+    # Privileged mode may be needed for serial port access
+    privileged: true

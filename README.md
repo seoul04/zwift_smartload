@@ -1,6 +1,6 @@
 # Zwift Fitness Sensor Relay
 
-A Bluetooth Low Energy (BLE) relay system that sits between fitness sensors (HR strap, power meter, smart trainer) and Zwift, enabling debugging of BLE traffic and working around unreliable Bluetooth in containerized environments.
+A Bluetooth Low Energy (BLE) relay system that sits between fitness sensors (HR strap, power meter, smart trainer) and Zwift, enabling debugging of BLE traffic and working around incorrect handling of the "Set Indoor Bike Simulation Parameters" (0x11) FTMS control point command in the current smartroller firmware.
 
 ## Project Overview
 
@@ -12,8 +12,7 @@ This project consists of two main components:
 ## Architecture
 
 ```
-Zwift <-> Companion App <-> Fitness Relay (this firmware) <-> Sensors
-                                                              (Polar H10, Favero Assioma, TruTrainer)
+Zwift <-> Companion App <-> Fitness Relay (this firmware) <-> Sensors (Polar H10, Favero Assioma, TruTrainer)
 ```
 
 ## Features
@@ -81,7 +80,7 @@ zwift/
 
 ## Motivation
 
-This project was created to debug intermittent resistance drops on a TruTrainer smartroller during specific slopes/speeds. Because Zwift runs under Wine in a Docker container on Manjaro, direct Bluetooth access is unreliable. Using a BLE relay allows the Zwift Companion app to connect to the relay instead of the sensors, enabling observation and debugging of the BLE traffic.
+This project was created to debug intermittent resistance drops on a TruTrainer smartroller during specific slopes/speeds. Using a BLE relay allows the Zwift to connect to the relay instead of the sensors, enabling observation and debugging of the BLE traffic.
 
 ## License
 

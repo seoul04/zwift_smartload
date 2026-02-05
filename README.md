@@ -40,7 +40,7 @@ Zwift <-> Companion App <-> Fitness Relay (this firmware) <-> Sensors (Polar H10
 
 ### Dongle Firmware
 
-See [dongle/README.rst](dongle/README.rst) and [dongle/project_description.md](dongle/project_description.md) for detailed build and flash instructions.
+See [dongle/README.md](dongle/README.md) and [dongle/project_description.md](dongle/project_description.md) for detailed build and flash instructions.
 
 1. Build using nRF Connect VS Code extension
 2. Flash using nRF Connect Desktop | Programmer

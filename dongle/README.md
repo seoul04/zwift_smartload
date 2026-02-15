@@ -31,7 +31,7 @@ Zwift ↔ Companion App ↔ Z-Relay (this firmware) ↔ Sensors
 ## Requirements
 
 ### Hardware
-- nRF52840-based dongle (tested with `nrf52840dongle/nrf52840`)
+- nRF52840-based dongle (tested with `nrf52840dongle/nrf52840` and Raytac MDBT50Q-CX)
 
 ### Software
 - Zephyr SDK / Nordic NCS v3.2.1+
@@ -40,19 +40,51 @@ Zwift ↔ Companion App ↔ Z-Relay (this firmware) ↔ Sensors
 
 ## Building
 
+### For nRF52840 Dongle:
 ```bash
 west build -b nrf52840dongle/nrf52840
 ```
 
+### For Raytac MDBT50Q-CX:
+```bash
+west build -b nrf52840dk/nrf52840 -- -DBOARD_ROOT=. \
+    -DDTC_OVERLAY_FILE=boards/raytac_mdbt50q_cx_nrf52840.overlay \
+    -DCONF_FILE=boards/raytac_mdbt50q_cx_nrf52840.conf
+```
+
+Or using nRF Connect for VS Code:
+1. Open the extension
+2. Add build configuration
+3. Board: `nrf52840dk/nrf52840`
+4. Board root: `.` (current directory)
+5. Extra CMake arguments: `-DDTC_OVERLAY_FILE=boards/raytac_mdbt50q_cx_nrf52840.overlay`
+
 ## Flashing
 
-Use the **nRF Connect Desktop Programmer** or:
+### nRF52840 Dongle (USB DFU)
+
+Use **nRF Connect Desktop Programmer** or via command line:
 
 ```bash
 nrfutil pkg generate --hw-version 52 --sd-req=0x00 \
     --application build/zephyr/zephyr.hex \
     --application-version 1 pkg.zip
 nrfutil dfu usb-serial -pkg pkg.zip -p /dev/ttyACM0
+```
+
+### Raytac MDBT50Q-CX (SWD/J-Link Required)
+
+The Raytac module is a bare module without USB bootloader. You need a **J-Link programmer** or **nRF52 DK** connected to the SWD pins:
+
+**Via nRF Connect Desktop Programmer:**
+1. Connect J-Link to module's SWD pins (SWDIO, SWDCLK, GND, VDD)
+2. Select J-Link device in Programmer
+3. Add `build_1/merged.hex`
+4. Click "Erase & Write"
+
+**Via command line:**
+```bash
+nrfjprog --program build_1/merged.hex --chiperase --verify -r
 ```
 
 ## Monitoring

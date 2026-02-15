@@ -225,8 +225,17 @@ int main(void)
 
 	log("Central HR Sample Version %s\n", VERSION);
 
-	bt_set_name("Z-Relay");
-	log("Bluetooth initialized as 'Z-Relay'\n");
+	/* Get persistent device suffix */
+	char device_suffix[8];
+	if (nvs_get_device_suffix(device_suffix, sizeof(device_suffix)) == 0) {
+		char full_name[32];
+		snprintf(full_name, sizeof(full_name), "Z-Relay-%s", device_suffix);
+		bt_set_name(full_name);
+		log("Bluetooth initialized as '%s'\n", full_name);
+	} else {
+		bt_set_name("Z-Relay");
+		log("Bluetooth initialized as 'Z-Relay' (suffix retrieval failed)\n");
+	}
 
 	start_advertising();
 	start_scan();

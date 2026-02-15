@@ -21,4 +21,7 @@ bool nvs_is_device_saved(const bt_addr_le_t *addr);
 /* Clear all saved devices */
 int nvs_clear_all_devices(void);
 
+/* Get or generate a persistent 4-digit hex suffix for the device name */
+int nvs_get_device_suffix(char *suffix, int max_len);
+
 #endif /* NVS_STORAGE_H_ */

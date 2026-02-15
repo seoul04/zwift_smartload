@@ -5,6 +5,7 @@
 #include <zephyr/drivers/flash.h>
 #include <zephyr/storage/flash_map.h>
 #include <zephyr/fs/nvs.h>
+#include <zephyr/sys/rand32.h>
 #include <string.h>
 #include "common.h"
 #include "nvs_storage.h"
@@ -15,6 +16,8 @@
 
 /* NVS IDs for saved devices (1-4) */
 #define NVS_DEVICE_BASE_ID	1
+/* NVS ID for device suffix (5) */
+#define NVS_DEVICE_SUFFIX_ID	5
 
 struct nvs_fs nvs;  /* Non-static for use by grade_limiter */
 static struct saved_device saved_devices[MAX_SAVED_DEVICES];
@@ -168,3 +171,38 @@ int nvs_clear_all_devices(void)
 	log("Cleared all saved devices\n");
 	return 0;
 }
+
+int nvs_get_device_suffix(char *suffix, int max_len)
+{
+	if (!nvs_initialized || !suffix || max_len < 5) {  /* Need room for "XXXX\0" */
+		return -EINVAL;
+	}
+
+	char stored_suffix[8];
+	ssize_t ret = nvs_read(&nvs, NVS_DEVICE_SUFFIX_ID, &stored_suffix, sizeof(stored_suffix));
+
+	if (ret > 0) {
+		/* Suffix exists in NVS, use it */
+		strncpy(suffix, stored_suffix, max_len - 1);
+		suffix[max_len - 1] = '\0';
+		return 0;
+	}
+
+	/* Generate new random 4-digit hex suffix */
+	uint16_t random_val = (uint16_t)(sys_rand32_get() & 0xFFFF);
+	snprintf(stored_suffix, sizeof(stored_suffix), "%04X", random_val);
+
+	/* Save to NVS */
+	ret = nvs_write(&nvs, NVS_DEVICE_SUFFIX_ID, stored_suffix, strlen(stored_suffix) + 1);
+	if (ret < 0) {
+		log("Failed to write device suffix to NVS (err %d)\n", ret);
+		/* Still use the generated suffix even if save failed */
+	}
+
+	strncpy(suffix, stored_suffix, max_len - 1);
+	suffix[max_len - 1] = '\0';
+	log("Generated new device suffix: %s\n", suffix);
+
+	return 0;
+}
+

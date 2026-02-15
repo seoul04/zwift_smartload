@@ -16,4 +16,9 @@ void start_advertising(void);
 void cancel_connection_timeout(struct bt_conn *conn);
 void save_connected_device(struct bt_conn *conn);
 
+/* Scanning window control */
+void start_scan_window(uint32_t duration_ms);
+void stop_scan_window(void);
+bool is_scan_window_active(void);
+
 #endif /* DEVICE_MANAGER_H_ */

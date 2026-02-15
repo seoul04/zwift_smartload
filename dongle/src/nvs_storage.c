@@ -5,7 +5,7 @@
 #include <zephyr/drivers/flash.h>
 #include <zephyr/storage/flash_map.h>
 #include <zephyr/fs/nvs.h>
-#include <zephyr/sys/rand32.h>
+#include <zephyr/drivers/hwinfo.h>
 #include <string.h>
 #include "common.h"
 #include "nvs_storage.h"
@@ -16,8 +16,6 @@
 
 /* NVS IDs for saved devices (1-4) */
 #define NVS_DEVICE_BASE_ID	1
-/* NVS ID for device suffix (5) */
-#define NVS_DEVICE_SUFFIX_ID	5
 
 struct nvs_fs nvs;  /* Non-static for use by grade_limiter */
 static struct saved_device saved_devices[MAX_SAVED_DEVICES];
@@ -174,35 +172,29 @@ int nvs_clear_all_devices(void)
 
 int nvs_get_device_suffix(char *suffix, int max_len)
 {
-	if (!nvs_initialized || !suffix || max_len < 5) {  /* Need room for "XXXX\0" */
+	if (!suffix || max_len < 5) {  /* Need room for "XXXX\0" (4 hex chars) */
 		return -EINVAL;
 	}
 
-	char stored_suffix[8];
-	ssize_t ret = nvs_read(&nvs, NVS_DEVICE_SUFFIX_ID, &stored_suffix, sizeof(stored_suffix));
-
-	if (ret > 0) {
-		/* Suffix exists in NVS, use it */
-		strncpy(suffix, stored_suffix, max_len - 1);
-		suffix[max_len - 1] = '\0';
-		return 0;
+	/* Get unique device ID from hardware (FICR on nRF52840) */
+	uint8_t device_id[16];
+	ssize_t id_len = hwinfo_get_device_id(device_id, sizeof(device_id));
+	
+	if (id_len <= 0) {
+		log("Failed to get device ID from hwinfo (err %d)\n", id_len);
+		return -ENODEV;
 	}
 
-	/* Generate new random 4-digit hex suffix */
-	uint16_t random_val = (uint16_t)(sys_rand32_get() & 0xFFFF);
-	snprintf(stored_suffix, sizeof(stored_suffix), "%04X", random_val);
-
-	/* Save to NVS */
-	ret = nvs_write(&nvs, NVS_DEVICE_SUFFIX_ID, stored_suffix, strlen(stored_suffix) + 1);
-	if (ret < 0) {
-		log("Failed to write device suffix to NVS (err %d)\n", ret);
-		/* Still use the generated suffix even if save failed */
+	/* Hash the device ID to 16-bit value (simple XOR-based hash) */
+	uint16_t hash = 0;
+	for (int i = 0; i < id_len; i++) {
+		hash ^= ((uint16_t)device_id[i] << (8 * (i % 2)));
 	}
 
-	strncpy(suffix, stored_suffix, max_len - 1);
-	suffix[max_len - 1] = '\0';
-	log("Generated new device suffix: %s\n", suffix);
+	/* Format as 4 hex characters */
+	snprintf(suffix, max_len, "%04X", hash);
 
+	log("Device suffix from hardware ID: %s\n", suffix);
 	return 0;
 }
 

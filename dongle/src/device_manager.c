@@ -23,6 +23,10 @@ static struct bt_conn *pending_conn = NULL;
 static uint32_t boot_time = 0;
 static bool exclusive_window_active = false;
 
+/* Scan window control - only scan during active window */
+static bool scan_window_active = false;
+static struct k_work_delayable scan_window_timeout;
+
 static void check_exclusive_window(void)
 {
 	if (exclusive_window_active) {
@@ -323,7 +327,7 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	}
 }
 
-void start_scan(void)
+static void _start_scan_internal(void)
 {
 	int err;
 
@@ -350,7 +354,21 @@ void start_scan(void)
 		}
 	}
 
-	log("Scanning successfully started\n");
+	if (scan_window_active) {
+		log("Scanning successfully started (window active)\n");
+	} else {
+		log("Scanning successfully started\n");
+	}
+}
+
+void start_scan(void)
+{
+	/* Only start scan if window is active */
+	if (!scan_window_active) {
+		return;
+	}
+
+	_start_scan_internal();
 }
 
 void start_advertising(void)
@@ -396,6 +414,50 @@ void start_advertising(void)
 	log("Advertising as 'Z-Relay' started\n");
 }
 
+static void scan_window_timeout_handler(struct k_work *work)
+{
+	int err;
+
+	log("Scan window expired - stopping scan\n");
+	err = bt_le_scan_stop();
+	if (err && err != -EALREADY) {
+		log("Failed to stop scan (err %d)\n", err);
+	}
+
+	scan_window_active = false;
+}
+
+void start_scan_window(uint32_t duration_ms)
+{
+	scan_window_active = true;
+	log("Scan window started for %u ms\n", duration_ms);
+
+	/* Schedule timeout to close window */
+	k_work_reschedule_for_queue(&k_sys_work_q, &scan_window_timeout,
+	                           K_MSEC(duration_ms));
+
+	/* Start scanning immediately */
+	_start_scan_internal();
+}
+
+void stop_scan_window(void)
+{
+	if (scan_window_active) {
+		int err = bt_le_scan_stop();
+		if (err && err != -EALREADY) {
+			log("Failed to stop scan (err %d)\n", err);
+		}
+		k_work_cancel_delayable(&scan_window_timeout);
+		scan_window_active = false;
+		log("Scan window stopped\n");
+	}
+}
+
+bool is_scan_window_active(void)
+{
+	return scan_window_active;
+}
+
 void save_connected_device(struct bt_conn *conn)
 {
 	/* Find device in list */
@@ -423,6 +485,7 @@ void device_manager_init(void)
 {
 	sys_slist_init(&device_list);
 	k_work_init_delayable(&conn_timeout_work, conn_timeout_handler);
+	k_work_init_delayable(&scan_window_timeout, scan_window_timeout_handler);
 	
 	/* Initialize NVS storage */
 	int err = nvs_storage_init();

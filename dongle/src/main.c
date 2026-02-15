@@ -22,11 +22,16 @@
 #include "notification_handler.h"
 #include "device_manager.h"
 #include "gatt_discovery.h"
+#include "nvs_storage.h"
 
 /* Button configuration */
 #define SW0_NODE DT_ALIAS(sw0)
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(SW0_NODE, gpios);
 static struct gpio_callback button_cb_data;
+
+/* Button press tracking */
+static uint32_t button_press_time = 0;
+static struct k_work_delayable long_press_work;
 
 /* Serial output mutex for thread-safe logging and JSON output */
 K_MUTEX_DEFINE(serial_output_mutex);
@@ -178,9 +183,40 @@ static void print_table_work_handler(struct k_work *work)
 
 K_WORK_DEFINE(print_table_work, print_table_work_handler);
 
+static void long_press_timeout_handler(struct k_work *work)
+{
+	/* Check if button is still pressed after 2 seconds */
+	int button_state = gpio_pin_get_dt(&button);
+	if (button_state == 1) {
+		/* Button still pressed - it's a long press */
+		log("Long button press detected - enabling scan window for 5 minutes\n");
+		start_scan_window(5 * 60 * 1000);  /* 5 minutes */
+	}
+}
+
 static void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
-	k_work_submit(&print_table_work);
+	int button_state = gpio_pin_get_dt(&button);
+	
+	if (button_state == 1) {
+		/* Button pressed */
+		button_press_time = k_uptime_get_32();
+		log("Button pressed\n");
+		
+		/* Schedule long press check after 2 seconds */
+		k_work_reschedule_for_queue(&k_sys_work_q, &long_press_work, K_MSEC(2000));
+	} else {
+		/* Button released */
+		uint32_t press_duration = k_uptime_get_32() - button_press_time;
+		
+		if (press_duration < 2000) {
+			/* Short press - cancel long press work and print device list */
+			k_work_cancel_delayable(&long_press_work);
+			log("Short button press (%u ms) - printing device list\n", press_duration);
+			k_work_submit(&print_table_work);
+		}
+		/* If long press, the timeout work already handled it */
+	}
 }
 
 int main(void)
@@ -206,11 +242,14 @@ int main(void)
 		return 0;
 	}
 
-	err = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
+	err = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_BOTH);
 	if (err < 0) {
 		log("Failed to configure button interrupt (err %d)\n", err);
 		return 0;
 	}
+
+	/* Initialize button press tracking work */
+	k_work_init_delayable(&long_press_work, long_press_timeout_handler);
 
 	gpio_init_callback(&button_cb_data, button_pressed, BIT(button.pin));
 	gpio_add_callback(button.port, &button_cb_data);
@@ -225,8 +264,8 @@ int main(void)
 
 	log("Central HR Sample Version %s\n", VERSION);
 
-	/* Get persistent device suffix */
-	char device_suffix[8];
+	/* Get unique device suffix from hardware ID (computed from FICR) */
+	char device_suffix[6];  /* 4 hex chars + null terminator */
 	if (nvs_get_device_suffix(device_suffix, sizeof(device_suffix)) == 0) {
 		char full_name[32];
 		snprintf(full_name, sizeof(full_name), "Z-Relay-%s", device_suffix);
@@ -238,6 +277,6 @@ int main(void)
 	}
 
 	start_advertising();
-	start_scan();
+	log("Device ready - press button for 2+ seconds to enable scanning (5 min window)\n");
 	return 0;
 }

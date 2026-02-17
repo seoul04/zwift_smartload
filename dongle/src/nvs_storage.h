@@ -18,6 +18,12 @@ int nvs_load_devices(struct saved_device *devices, int max_devices);
 /* Check if a device is saved */
 bool nvs_is_device_saved(const bt_addr_le_t *addr);
 
+/* Get saved device info (returns svc_mask, or 0 if not found) */
+uint8_t nvs_get_saved_svc_mask(const bt_addr_le_t *addr);
+
+/* Get saved device name (returns NULL if not found) */
+const char *nvs_get_saved_name(const bt_addr_le_t *addr);
+
 /* Clear all saved devices */
 int nvs_clear_all_devices(void);
 

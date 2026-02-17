@@ -53,8 +53,6 @@ uint8_t notify_func(struct bt_conn *conn,
 		return BT_GATT_ITER_CONTINUE;
 	}
 
-	log("[DEBUG] Notification: svc_type=%d, length=%u, handle=%u\n", svc_type, length, params->value_handle);
-
 	/* Get RSSI - use a cached value since live RSSI requires async callback */
 	/* We'll update it periodically in main loop instead */
 

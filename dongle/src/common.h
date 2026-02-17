@@ -32,10 +32,11 @@ extern struct k_mutex serial_output_mutex;
 
 #define VERSION "1.15"
 
+#define DEVICE_NAME_PREFIX "Z-Relay"
+
 #define MAX_CONNECTIONS 3  /* HR, Power Meter, Trainer */
 #define MAX_SUBSCRIPTIONS_PER_CONN 5  /* Trainer needs: Indoor Bike Data, Training Status, Machine Status, Control Point */
 #define MAX_SAVED_DEVICES 4
-#define EXCLUSIVE_WINDOW_MS (6 * 60 * 1000)  /* 6 minutes */
 
 /* Saved device structure for NVS persistence */
 struct saved_device {

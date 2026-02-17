@@ -41,6 +41,9 @@ struct conn_slot connections[MAX_CONNECTIONS];
 struct bt_conn *peripheral_conn = NULL;
 uint32_t last_cp_data_time = 0;
 uint64_t total_rx_count = 0;
+static char device_name_buffer[32] = DEVICE_NAME_PREFIX;  /* Store current device name for advertising callbacks */
+static uint32_t last_button_event_time = 0;  /* For debouncing */
+#define BUTTON_DEBOUNCE_MS 100
 
 /* Services to discover */
 const struct bt_uuid *discover_services[] = {
@@ -166,7 +169,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 			log("[FTMS CP] Cleared peripheral connection\n");
 		}
 		
-		start_advertising();
+		start_advertising(device_name_buffer);
 	}
 }
 
@@ -190,17 +193,33 @@ static void long_press_timeout_handler(struct k_work *work)
 	if (button_state == 1) {
 		/* Button still pressed - it's a long press */
 		log("Long button press detected - enabling scan window for 5 minutes\n");
+		
+		/* Disconnect all connected devices */
+		disconnect_all_devices();
+		
+		/* Clear saved devices to start fresh pairing */
+		nvs_clear_all_devices();
+		log("Cleared all saved devices\n");
+		
 		start_scan_window(5 * 60 * 1000);  /* 5 minutes */
 	}
 }
 
 static void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
+	uint32_t now = k_uptime_get_32();
+	
+	/* Debounce - ignore events within 100ms of last event */
+	if ((now - last_button_event_time) < BUTTON_DEBOUNCE_MS) {
+		return;
+	}
+	last_button_event_time = now;
+	
 	int button_state = gpio_pin_get_dt(&button);
 	
 	if (button_state == 1) {
 		/* Button pressed */
-		button_press_time = k_uptime_get_32();
+		button_press_time = now;
 		log("Button pressed\n");
 		
 		/* Schedule long press check after 2 seconds */
@@ -223,6 +242,9 @@ int main(void)
 {
 	int err;
 
+	/* Delay to allow serial terminal to connect before first logs */
+	k_sleep(K_SECONDS(5));
+
 	err = bt_enable(NULL);
 
 	if (err) {
@@ -242,14 +264,14 @@ int main(void)
 		return 0;
 	}
 
+	/* Initialize button press tracking work BEFORE configuring interrupt */
+	k_work_init_delayable(&long_press_work, long_press_timeout_handler);
+
 	err = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_BOTH);
 	if (err < 0) {
 		log("Failed to configure button interrupt (err %d)\n", err);
 		return 0;
 	}
-
-	/* Initialize button press tracking work */
-	k_work_init_delayable(&long_press_work, long_press_timeout_handler);
 
 	gpio_init_callback(&button_cb_data, button_pressed, BIT(button.pin));
 	gpio_add_callback(button.port, &button_cb_data);
@@ -264,19 +286,21 @@ int main(void)
 
 	log("Central HR Sample Version %s\n", VERSION);
 
-	/* Get unique device suffix from hardware ID (computed from FICR) */
-	char device_suffix[6];  /* 4 hex chars + null terminator */
-	if (nvs_get_device_suffix(device_suffix, sizeof(device_suffix)) == 0) {
-		char full_name[32];
-		snprintf(full_name, sizeof(full_name), "Z-Relay-%s", device_suffix);
-		bt_set_name(full_name);
-		log("Bluetooth initialized as '%s'\n", full_name);
+	/* Get device suffix and create full device name */
+	char device_suffix[6];
+	int suffix_result = nvs_get_device_suffix(device_suffix, sizeof(device_suffix));
+	
+	if (suffix_result == 0) {
+		snprintf(device_name_buffer, sizeof(device_name_buffer), DEVICE_NAME_PREFIX "-%s", device_suffix);
 	} else {
-		bt_set_name("Z-Relay");
-		log("Bluetooth initialized as 'Z-Relay' (suffix retrieval failed)\n");
+		strncpy(device_name_buffer, DEVICE_NAME_PREFIX, sizeof(device_name_buffer) - 1);
+		device_name_buffer[sizeof(device_name_buffer) - 1] = '\0';
 	}
+	
+	bt_set_name(device_name_buffer);
+	log("Bluetooth initialized as '%s'\n", device_name_buffer);
 
-	start_advertising();
+	start_advertising(device_name_buffer);
 	log("Device ready - press button for 2+ seconds to enable scanning (5 min window)\n");
 	return 0;
 }

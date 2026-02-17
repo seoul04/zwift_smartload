@@ -19,24 +19,9 @@ sys_slist_t device_list;
 static struct k_work_delayable conn_timeout_work;
 static struct bt_conn *pending_conn = NULL;
 
-/* Boot timestamp for exclusive window */
-static uint32_t boot_time = 0;
-static bool exclusive_window_active = false;
-
 /* Scan window control - only scan during active window */
 static bool scan_window_active = false;
 static struct k_work_delayable scan_window_timeout;
-
-static void check_exclusive_window(void)
-{
-	if (exclusive_window_active) {
-		uint32_t elapsed = k_uptime_get_32() - boot_time;
-		if (elapsed >= EXCLUSIVE_WINDOW_MS) {
-			exclusive_window_active = false;
-			log("Exclusive window expired - now accepting all devices\n");
-		}
-	}
-}
 
 void print_device_list(void)
 {
@@ -152,9 +137,6 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			 struct net_buf_simple *ad)
 {
 	char dev[BT_ADDR_LE_STR_LEN];
-	
-	/* Check if exclusive window has expired */
-	check_exclusive_window();
 
 	bt_addr_le_to_str(addr, dev, sizeof(dev));
 
@@ -168,6 +150,11 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	parse_ctx.svc_mask = 0;
 
 	bt_data_parse(ad, eir_found, &parse_ctx);
+
+	/* Filter out other Z-Relay devices to avoid cross-connection */
+	if (strncmp(parse_ctx.name, DEVICE_NAME_PREFIX, strlen(DEVICE_NAME_PREFIX)) == 0) {
+		return;
+	}
 
 	uint32_t now = k_uptime_get_32();
 
@@ -197,10 +184,17 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 		/* Check if device is saved */
 		dev_info->is_saved = nvs_is_device_saved(&dev_info->addr);
 	} else if (!found) {
-		/* Only track devices with relevant services or saved devices to avoid memory issues */
+		/* Only track saved devices, or any device during scan window */
 		bool is_saved = nvs_is_device_saved(addr);
-		if (parse_ctx.svc_mask == 0 && !is_saved) {
-			/* Skip devices without HR/CP/FTMS services and not saved */
+		
+		/* Outside scan window: only track saved devices */
+		if (!scan_window_active && !is_saved) {
+			return;
+		}
+		
+		/* During scan window: track devices with relevant services */
+		if (scan_window_active && parse_ctx.svc_mask == 0 && !is_saved) {
+			/* Skip devices without HR/CP/FTMS services */
 			return;
 		}
 		
@@ -219,7 +213,7 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			dev_info->is_saved = is_saved;
 			dev_info->rssi = rssi;  /* Store RSSI from advertisement */
 			sys_slist_append(&device_list, &dev_info->node);
-			log("Added device: %s\n", dev_info->name);
+			log("Added device: %s (svc_mask=%d, saved=%d)\n", dev_info->name, dev_info->svc_mask, is_saved);
 			print_device_list();
 		} else {
 			log("ERROR: Failed to allocate memory for device %s\n", dev);
@@ -246,13 +240,12 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			}
 		}
 
-		/* Check exclusive window - only saved devices can connect in first 6 minutes */
-		if (exclusive_window_active && !already_connected) {
-			if (!dev_info->is_saved) {
-				/* Skip non-saved devices during exclusive window */
+		/* Saved devices can connect anytime; non-saved only during scan window */
+		if (!already_connected && !dev_info->is_saved) {
+			if (!scan_window_active) {
+				/* Skip non-saved devices outside scan window */
 				return;
 			}
-			log("[Exclusive Window] Connecting to saved device: %s\n", dev_info->name);
 		}
 
 		if (!already_connected) {
@@ -363,15 +356,10 @@ static void _start_scan_internal(void)
 
 void start_scan(void)
 {
-	/* Only start scan if window is active */
-	if (!scan_window_active) {
-		return;
-	}
-
 	_start_scan_internal();
 }
 
-void start_advertising(void)
+void start_advertising(const char *device_name)
 {
 	int err;
 	
@@ -387,14 +375,14 @@ void start_advertising(void)
 		log("Failed to stop advertising (err %d)\n", err);
 	}
 	
-	const struct bt_data ad[] = {
+	struct bt_data ad[] = {
 		BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 		BT_DATA_BYTES(BT_DATA_UUID16_ALL,
 			BT_BYTES_LIST_LE16(BT_UUID_HRS_VAL),
 			BT_BYTES_LIST_LE16(0x1816),
 			BT_BYTES_LIST_LE16(0x1818),
 			BT_BYTES_LIST_LE16(0x1826)),
-		BT_DATA(BT_DATA_NAME_COMPLETE, "Z-Relay", sizeof("Z-Relay") - 1),
+		BT_DATA(BT_DATA_NAME_COMPLETE, (unsigned char *)device_name, strlen(device_name)),
 	};
 
 	struct bt_le_adv_param adv_param = {
@@ -411,20 +399,19 @@ void start_advertising(void)
 		return;
 	}
 
-	log("Advertising as 'Z-Relay' started\n");
+	log("Advertising as '%s' started\n", device_name);
+	
+	/* Restart scanning so saved devices can reconnect while advertising */
+	start_scan();
 }
 
 static void scan_window_timeout_handler(struct k_work *work)
 {
-	int err;
-
-	log("Scan window expired - stopping scan\n");
-	err = bt_le_scan_stop();
-	if (err && err != -EALREADY) {
-		log("Failed to stop scan (err %d)\n", err);
-	}
-
+	log("Scan window expired - resuming normal scanning\n");
 	scan_window_active = false;
+	
+	/* Restart scanning to allow saved devices to reconnect normally */
+	start_scan();
 }
 
 void start_scan_window(uint32_t duration_ms)
@@ -456,6 +443,18 @@ void stop_scan_window(void)
 bool is_scan_window_active(void)
 {
 	return scan_window_active;
+}
+
+void disconnect_all_devices(void)
+{
+	for (int i = 0; i < MAX_CONNECTIONS; i++) {
+		if (connections[i].conn) {
+			char addr[BT_ADDR_LE_STR_LEN];
+			bt_addr_le_to_str(bt_conn_get_dst(connections[i].conn), addr, sizeof(addr));
+			log("Disconnecting device: %s\n", addr);
+			bt_conn_disconnect(connections[i].conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		}
+	}
 }
 
 void save_connected_device(struct bt_conn *conn)
@@ -496,12 +495,15 @@ void device_manager_init(void)
 		struct saved_device saved[MAX_SAVED_DEVICES];
 		int count = nvs_load_devices(saved, MAX_SAVED_DEVICES);
 		log("Loaded %d saved device(s) from NVS\n", count);
-		
-		/* Start exclusive window timer */
-		boot_time = k_uptime_get_32();
-		exclusive_window_active = (count > 0);
-		if (exclusive_window_active) {
-			log("Exclusive window active for saved devices (6 minutes)\n");
+		for (int i = 0; i < count; i++) {
+			if (saved[i].valid) {
+				char addr_str[BT_ADDR_LE_STR_LEN];
+				bt_addr_le_to_str(&saved[i].addr, addr_str, sizeof(addr_str));
+				log("  [%d] %s (%s) svc_mask=%d\n", i, saved[i].name, addr_str, saved[i].svc_mask);
+			}
 		}
 	}
+	
+	/* Always start scanning - saved devices can reconnect anytime */
+	start_scan();
 }

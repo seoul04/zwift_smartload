@@ -154,6 +154,36 @@ bool nvs_is_device_saved(const bt_addr_le_t *addr)
 	return false;
 }
 
+uint8_t nvs_get_saved_svc_mask(const bt_addr_le_t *addr)
+{
+	if (!nvs_initialized) {
+		return 0;
+	}
+
+	for (int i = 0; i < MAX_SAVED_DEVICES; i++) {
+		if (saved_devices[i].valid && !bt_addr_le_cmp(&saved_devices[i].addr, addr)) {
+			return saved_devices[i].svc_mask;
+		}
+	}
+
+	return 0;
+}
+
+const char *nvs_get_saved_name(const bt_addr_le_t *addr)
+{
+	if (!nvs_initialized) {
+		return NULL;
+	}
+
+	for (int i = 0; i < MAX_SAVED_DEVICES; i++) {
+		if (saved_devices[i].valid && !bt_addr_le_cmp(&saved_devices[i].addr, addr)) {
+			return saved_devices[i].name;
+		}
+	}
+
+	return NULL;
+}
+
 int nvs_clear_all_devices(void)
 {
 	if (!nvs_initialized) {

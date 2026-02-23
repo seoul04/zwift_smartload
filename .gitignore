@@ -1,5 +1,6 @@
 # Build artifacts
-dongle/build/
+dongle/build*/
+dongle/Trash
 *.o
 *.obj
 *.a

@@ -14,7 +14,7 @@ bool ftms_cp_indicate_enabled = false;
 bool ftms_cp_indicating = false;
 
 /* Grade to resistance conversion: grade -100 -> 0, grade 1900 -> 100 */
-#define GRADE_RESISTANCE(x) MAX(MIN(((x) + 100) / 20, 100), 0)
+#define GRADE_RESISTANCE(x) MAX(MIN(((x) + 120) / 20, 100), 0)
 
 /* Track if last command was converted from 0x11 to 0x04 */
 static bool last_cmd_was_converted = false;

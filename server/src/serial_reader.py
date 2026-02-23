@@ -63,6 +63,24 @@ class SerialReader:
         """Check if serial port is connected and open."""
         return self.serial_conn is not None and self.serial_conn.is_open
     
+    def _close_port(self):
+        """Fully close and release the serial port."""
+        if self.serial_conn is not None:
+            try:
+                if self.serial_conn.is_open:
+                    self.serial_conn.cancel_read()
+            except Exception:
+                pass
+            try:
+                self.serial_conn.close()
+            except Exception:
+                pass
+            # Delete the object to fully release the file descriptor
+            self.serial_conn = None
+            # Small delay to let the OS release the port
+            time.sleep(2)
+            logger.debug("Serial port released")
+    
     def start(self):
         """Start reading from the serial port."""
         if self.running:
@@ -78,22 +96,7 @@ class SerialReader:
             except Exception as e:
                 logger.exception(f"Failed to open log file: {e}")
         
-        # Connect to serial port
-        try:
-            self.serial_conn = serial.Serial(
-                port=self.port,
-                baudrate=self.baudrate,
-                timeout=1.0,
-                xonxoff=False,
-                rtscts=False,
-                dsrdtr=False
-            )
-            self.serial_conn.reset_input_buffer()
-            logger.info(f"Connected to {self.port}")
-        except serial.SerialException as e:
-            logger.exception(f"Failed to connect: {e}")
-            return
-        
+        # Start read loop thread (it will connect and retry every 2s if port unavailable)
         self.running = True
         self.thread = threading.Thread(target=self._read_loop, daemon=True)
         self.thread.start()
@@ -101,8 +104,7 @@ class SerialReader:
     def stop(self):
         """Stop reading."""
         self.running = False
-        if self.serial_conn and self.serial_conn.is_open:
-            self.serial_conn.close()
+        self._close_port()
         if self.thread:
             self.thread.join(timeout=2)
         if self.log_file_handle:
@@ -119,7 +121,9 @@ class SerialReader:
                     if line:
                         self._process_line(line)
                 else:
-                    # Try to reconnect
+                    # Ensure port is fully released before reconnecting
+                    self._close_port()
+                    logger.info(f"Connecting to {self.port}...")
                     time.sleep(2)
                     try:
                         self.serial_conn = serial.Serial(
@@ -131,17 +135,12 @@ class SerialReader:
                             dsrdtr=False
                         )
                         self.serial_conn.reset_input_buffer()
-                        logger.info(f"Reconnected to {self.port}")
-                    except serial.SerialException:
-                        pass
+                        logger.info(f"Connected to {self.port}")
+                    except serial.SerialException as e:
+                        logger.warning(f"Could not connect: {e}. Retrying in 2 seconds.")
             except serial.SerialException as e:
                 logger.error(f"Serial error: {e}")
-                if self.serial_conn:
-                    try:
-                        self.serial_conn.close()
-                    except:
-                        pass
-                    self.serial_conn = None
+                self._close_port()
                 time.sleep(2)
             except Exception as e:
                 logger.exception(f"Error in read loop: {e}")

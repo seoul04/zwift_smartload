@@ -12,6 +12,7 @@
 #include "common.h"
 #include "device_manager.h"
 #include "nvs_storage.h"
+#include "led_feedback.h"
 
 sys_slist_t device_list;
 
@@ -410,6 +411,9 @@ static void scan_window_timeout_handler(struct k_work *work)
 	log("Scan window expired - resuming normal scanning\n");
 	scan_window_active = false;
 	
+	/* Update LED feedback for scan window end */
+	led_feedback_update();
+	
 	/* Restart scanning to allow saved devices to reconnect normally */
 	start_scan();
 }
@@ -418,6 +422,9 @@ void start_scan_window(uint32_t duration_ms)
 {
 	scan_window_active = true;
 	log("Scan window started for %u ms\n", duration_ms);
+	
+	/* Update LED feedback for scan window start */
+	led_feedback_update();
 
 	/* Schedule timeout to close window */
 	k_work_reschedule_for_queue(&k_sys_work_q, &scan_window_timeout,
@@ -436,6 +443,10 @@ void stop_scan_window(void)
 		}
 		k_work_cancel_delayable(&scan_window_timeout);
 		scan_window_active = false;
+		
+		/* Update LED feedback for scan window stop */
+		led_feedback_update();
+		
 		log("Scan window stopped\n");
 	}
 }

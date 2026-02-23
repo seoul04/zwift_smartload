@@ -23,6 +23,7 @@
 #include "device_manager.h"
 #include "gatt_discovery.h"
 #include "nvs_storage.h"
+#include "led_feedback.h"
 
 /* Button configuration */
 #define SW0_NODE DT_ALIAS(sw0)
@@ -89,6 +90,9 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 
 	log("Connected: %s\n", addr);
 	
+	/* Update LED feedback for new connection */
+	led_feedback_update();
+	
 	/* Copy RSSI from device_info (captured during scanning) */
 	slot->rssi = 0;  /* Default if not found */
 	struct device_info *dev_info;
@@ -149,6 +153,9 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 			connections[i].conn = NULL;
 			log("Freed connection slot %d\n", i);
 			found_slot = true;
+			
+			/* Update LED feedback for disconnection */
+			led_feedback_update();
 			break;
 		}
 	}
@@ -280,6 +287,7 @@ int main(void)
 	/* Initialize modules */
 	device_manager_init();
 	ftms_control_point_init();
+	led_feedback_init();
 
 	/* Print initial device list */
 	print_device_list();

@@ -13,6 +13,7 @@ target_sources(app PRIVATE
     src/device_manager.c
     src/gatt_discovery.c
     src/nvs_storage.c
+    src/led_feedback.c
 )
 
 zephyr_library_include_directories(${ZEPHYR_BASE}/samples/bluetooth)

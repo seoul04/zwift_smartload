@@ -10,6 +10,103 @@
 #include "ftms_control_point.h"
 #include "device_manager.h"
 
+static uint8_t battery_read_func(struct bt_conn *conn, uint8_t err,
+				 struct bt_gatt_read_params *params,
+				 const void *data, uint16_t length)
+{
+	if (err) {
+		log("[BAS] Battery read failed (err %u)\n", err);
+		return BT_GATT_ITER_STOP;
+	}
+
+	if (!data || length < 1) {
+		return BT_GATT_ITER_STOP;
+	}
+
+	const uint8_t battery_level = ((const uint8_t *)data)[0];
+
+	for (int i = 0; i < MAX_CONNECTIONS; i++) {
+		if (connections[i].conn != conn) {
+			continue;
+		}
+
+		struct device_info *dev_info;
+		SYS_SLIST_FOR_EACH_CONTAINER(&device_list, dev_info, node) {
+			if (!bt_addr_le_cmp(&dev_info->addr, bt_conn_get_dst(conn))) {
+				dev_info->has_battery_service = true;
+				dev_info->battery_level = (int8_t)battery_level;
+				break;
+			}
+		}
+		break;
+	}
+
+	print_device_list();
+
+	return BT_GATT_ITER_STOP;
+}
+
+static uint8_t battery_discover_func(struct bt_conn *conn,
+				     const struct bt_gatt_attr *attr,
+				     struct bt_gatt_discover_params *params)
+{
+	struct conn_slot *slot = NULL;
+	for (int i = 0; i < MAX_CONNECTIONS; i++) {
+		if (params == &connections[i].battery_discover_params) {
+			slot = &connections[i];
+			break;
+		}
+	}
+
+	if (!slot) {
+		return BT_GATT_ITER_STOP;
+	}
+
+	if (!attr) {
+		if (params->type == BT_GATT_DISCOVER_PRIMARY) {
+			log("[BAS] Battery service not found\n");
+		}
+		(void)memset(params, 0, sizeof(*params));
+		return BT_GATT_ITER_STOP;
+	}
+
+	if (params->type == BT_GATT_DISCOVER_PRIMARY) {
+		const struct bt_gatt_service_val *service = attr->user_data;
+
+		slot->battery_uuid.uuid.type = BT_UUID_TYPE_16;
+		slot->battery_uuid.val = 0x2A19;
+		slot->battery_discover_params.uuid = &slot->battery_uuid.uuid;
+		slot->battery_discover_params.func = battery_discover_func;
+		slot->battery_discover_params.start_handle = attr->handle + 1;
+		slot->battery_discover_params.end_handle = service->end_handle;
+		slot->battery_discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+
+		int err = bt_gatt_discover(conn, &slot->battery_discover_params);
+		if (err) {
+			log("[BAS] Characteristic discover failed (err %d)\n", err);
+		}
+
+		return BT_GATT_ITER_STOP;
+	}
+
+	const struct bt_gatt_chrc *chrc = attr->user_data;
+	uint16_t value_handle = bt_gatt_attr_value_handle(attr);
+
+	(void)memset(&slot->battery_read_params, 0, sizeof(slot->battery_read_params));
+	slot->battery_read_params.func = battery_read_func;
+	slot->battery_read_params.handle_count = 1;
+	slot->battery_read_params.single.handle = value_handle;
+	slot->battery_read_params.single.offset = 0;
+
+	int err = bt_gatt_read(conn, &slot->battery_read_params);
+	if (err) {
+		log("[BAS] Read request failed (err %d, props 0x%02x)\n", err, chrc->properties);
+	}
+
+	(void)memset(params, 0, sizeof(*params));
+	return BT_GATT_ITER_STOP;
+}
+
 uint8_t discover_func(struct bt_conn *conn,
 		      const struct bt_gatt_attr *attr,
 		      struct bt_gatt_discover_params *params)
@@ -48,6 +145,7 @@ uint8_t discover_func(struct bt_conn *conn,
 				log("Discover failed (err %d)\n", err);
 			}
 		} else {
+			start_battery_level_check(conn, (int)(slot - connections));
 			start_scan();
 		}
 
@@ -218,6 +316,7 @@ uint8_t discover_func(struct bt_conn *conn,
 			}
 		} else {
 			log("Discover complete for all services\n");
+			start_battery_level_check(conn, (int)(slot - connections));
 			start_scan();
 		}
 
@@ -245,5 +344,26 @@ void start_discovery(struct bt_conn *conn, int slot_idx)
 	if (err) {
 		log("Discover failed(err %d)\n", err);
 		start_scan();
+	}
+}
+
+void start_battery_level_check(struct bt_conn *conn, int slot_idx)
+{
+	struct conn_slot *slot = &connections[slot_idx];
+
+	(void)memset(&slot->battery_discover_params, 0, sizeof(slot->battery_discover_params));
+	(void)memset(&slot->battery_read_params, 0, sizeof(slot->battery_read_params));
+
+	slot->battery_uuid.uuid.type = BT_UUID_TYPE_16;
+	slot->battery_uuid.val = 0x180F;
+	slot->battery_discover_params.uuid = &slot->battery_uuid.uuid;
+	slot->battery_discover_params.func = battery_discover_func;
+	slot->battery_discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+	slot->battery_discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+	slot->battery_discover_params.type = BT_GATT_DISCOVER_PRIMARY;
+
+	int err = bt_gatt_discover(conn, &slot->battery_discover_params);
+	if (err) {
+		log("[BAS] Discover failed (err %d)\n", err);
 	}
 }

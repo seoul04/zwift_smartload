@@ -9,9 +9,33 @@
 #include "common.h"
 #include "notification_handler.h"
 #include "gatt_services.h"
+#include "device_manager.h"
 
 /* CP data cache for injection into FTMS */
 struct cp_cache cached_cp_data = {0};
+
+static int get_battery_level_for_conn(struct bt_conn *conn)
+{
+	const bt_addr_le_t *dst = bt_conn_get_dst(conn);
+	struct device_info *dev_info;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&device_list, dev_info, node) {
+		if (!bt_addr_le_cmp(&dev_info->addr, dst)) {
+			return dev_info->battery_level;
+		}
+	}
+
+	return -1;
+}
+
+static void json_out_battery_field(int battery_level)
+{
+	if (battery_level >= 0) {
+		json_out(",\"battery_level\":%d", battery_level);
+	} else {
+		json_out(",\"battery_level\":null");
+	}
+}
 
 uint8_t notify_func(struct bt_conn *conn,
 		    struct bt_gatt_subscribe_params *params,
@@ -59,6 +83,7 @@ uint8_t notify_func(struct bt_conn *conn,
 	if (svc_type == 0) {
 		/* HR service */
 		const uint8_t *hr_data = data;
+		int battery_level = get_battery_level_for_conn(conn);
 		uint8_t flags = hr_data[0];
 		uint8_t hr_format = flags & 0x01;
 		uint16_t heart_rate;
@@ -82,9 +107,12 @@ uint8_t notify_func(struct bt_conn *conn,
 		memcpy(hr_measurement, data, length);
 		bt_gatt_notify(NULL, &hr_svc.attrs[1], hr_measurement, hr_measurement_len);
 
-		json_out("{\"type\":\"hr\",\"ts\":%u,\"bpm\":%u,\"rssi\":%d}\n", k_uptime_get_32(), heart_rate, slot->rssi);
+		json_out("{\"type\":\"hr\",\"ts\":%u,\"bpm\":%u,\"rssi\":%d", k_uptime_get_32(), heart_rate, slot->rssi);
+		json_out_battery_field(battery_level);
+		json_out("}\n");
 	} else if (svc_type == 1) {
 		/* CP service - always relay to Zwift immediately */
+		int battery_level = get_battery_level_for_conn(conn);
 		cp_measurement_len = length;
 		memcpy(cp_measurement, data, length);
 		bt_gatt_notify(NULL, &cp_svc.attrs[1], cp_measurement, cp_measurement_len);
@@ -103,6 +131,7 @@ uint8_t notify_func(struct bt_conn *conn,
 			cached_cp_data.timestamp = last_cp_data_time;
 			
 			json_out("{\"type\":\"cp\",\"ts\":%u,\"power\":%d,\"flags\":%u,\"rssi\":%d", last_cp_data_time, power, flags, slot->rssi);
+			json_out_battery_field(battery_level);
 			
 			if (flags & 0x01) {
 				if (length > offset) {
@@ -169,6 +198,7 @@ uint8_t notify_func(struct bt_conn *conn,
 	} else if (svc_type == 2) {
 		/* FTMS Indoor Bike Data */
 		const uint8_t *ftms_data = data;
+		int battery_level = get_battery_level_for_conn(conn);
 		uint16_t flags = 0;
 		bool cp_active = false;
 		int cadence_offset = -1;
@@ -183,6 +213,7 @@ uint8_t notify_func(struct bt_conn *conn,
 			cp_active = (cached_cp_data.valid && (now - cached_cp_data.timestamp) < CP_TIMEOUT_MS);
 			
 			json_out("{\"type\":\"ftms\",\"ts\":%u,\"flags\":%u,\"rssi\":%d", now, flags, slot->rssi);
+			json_out_battery_field(battery_level);
 			
 			/* Instantaneous Speed */
 			if (length >= offset + 2) {

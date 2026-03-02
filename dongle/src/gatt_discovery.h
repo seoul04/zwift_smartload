@@ -12,5 +12,6 @@ uint8_t discover_func(struct bt_conn *conn,
 		      struct bt_gatt_discover_params *params);
 
 void start_discovery(struct bt_conn *conn, int slot_idx);
+void start_battery_level_check(struct bt_conn *conn, int slot_idx);
 
 #endif /* GATT_DISCOVERY_H_ */

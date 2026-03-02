@@ -51,9 +51,15 @@ void print_device_list(void)
 			}
 		}
 		bt_addr_le_to_str(&dev_info->addr, addr, sizeof(addr));
-		json_out("{\"name\":\"%s\",\"addr\":\"%s\",\"connected\":%s,\"saved\":%s,\"last_seen\":%u}",
+		json_out("{\"name\":\"%s\",\"addr\":\"%s\",\"connected\":%s,\"saved\":%s,\"battery_level\":",
 		       dev_info->name, addr, is_connected ? "true" : "false", 
-		       dev_info->is_saved ? "true" : "false", dev_info->last_seen);
+		       dev_info->is_saved ? "true" : "false");
+		if (dev_info->battery_level >= 0) {
+			json_out("%d", dev_info->battery_level);
+		} else {
+			json_out("null");
+		}
+		json_out(",\"last_seen\":%u}", dev_info->last_seen);
 		if (idx < count - 1) {
 			json_out(",");
 		}
@@ -94,6 +100,7 @@ static bool eir_found(struct bt_data *data, void *user_data)
 		const bt_addr_le_t *addr;
 		char name[32];
 		uint8_t svc_mask;
+		bool has_battery_service;
 	} *ctx = user_data;
 
 	int i;
@@ -108,7 +115,8 @@ static bool eir_found(struct bt_data *data, void *user_data)
 		for (i = 0; i < data->data_len; i += sizeof(uint16_t)) {
 			uint16_t u16;
 			memcpy(&u16, &data->data[i], sizeof(u16));
-			const struct bt_uuid *uuid = BT_UUID_DECLARE_16(sys_le16_to_cpu(u16));
+			uint16_t uuid16 = sys_le16_to_cpu(u16);
+			const struct bt_uuid *uuid = BT_UUID_DECLARE_16(uuid16);
 
 			if (!bt_uuid_cmp(uuid, BT_UUID_HRS)) {
 				ctx->svc_mask |= 0x01;
@@ -116,6 +124,8 @@ static bool eir_found(struct bt_data *data, void *user_data)
 				ctx->svc_mask |= 0x02;
 			} else if (!bt_uuid_cmp(uuid, BT_UUID_DECLARE_16(0x1826))) {
 				ctx->svc_mask |= 0x04;
+			} else if (uuid16 == 0x180F) {
+				ctx->has_battery_service = true;
 			}
 		}
 		break;
@@ -145,10 +155,12 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 		const bt_addr_le_t *addr;
 		char name[32];
 		uint8_t svc_mask;
+		bool has_battery_service;
 	} parse_ctx;
 	parse_ctx.addr = addr;
 	parse_ctx.name[0] = '\0';
 	parse_ctx.svc_mask = 0;
+	parse_ctx.has_battery_service = false;
 
 	bt_data_parse(ad, eir_found, &parse_ctx);
 
@@ -181,6 +193,7 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 		}
 		dev_info->last_seen = now;
 		dev_info->svc_mask |= parse_ctx.svc_mask;
+		dev_info->has_battery_service = dev_info->has_battery_service || parse_ctx.has_battery_service;
 		dev_info->rssi = rssi;  /* Update RSSI from latest advertisement */
 		/* Check if device is saved */
 		dev_info->is_saved = nvs_is_device_saved(&dev_info->addr);
@@ -210,6 +223,8 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 				dev_info->name[sizeof(dev_info->name) - 1] = '\0';
 			}
 			dev_info->svc_mask = parse_ctx.svc_mask;
+			dev_info->has_battery_service = parse_ctx.has_battery_service;
+			dev_info->battery_level = -1;
 			dev_info->last_seen = now;
 			dev_info->is_saved = is_saved;
 			dev_info->rssi = rssi;  /* Store RSSI from advertisement */

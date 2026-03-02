@@ -53,6 +53,8 @@ struct device_info {
 	char name[32];
 	uint32_t last_seen;
 	uint8_t svc_mask;
+	bool has_battery_service;
+	int8_t battery_level;  /* -1 if unknown, else 0..100 */
 	bool is_saved;  /* true if this device was previously saved */
 	int8_t rssi;    /* Last observed RSSI from scanning */
 };
@@ -69,6 +71,9 @@ struct conn_slot {
 	uint16_t ftms_control_point_handle;
 	struct bt_gatt_indicate_params indicate_params;
 	uint16_t temp_value_handle;
+	struct bt_uuid_16 battery_uuid;
+	struct bt_gatt_discover_params battery_discover_params;
+	struct bt_gatt_read_params battery_read_params;
 	int8_t rssi;  /* Last known RSSI */
 };
 

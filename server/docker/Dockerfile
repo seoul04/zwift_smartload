@@ -20,8 +20,8 @@ COPY . .
 # Create directories for logs
 RUN mkdir -p /app/logs
 
-# Expose Flask port
-EXPOSE 5000
+# Flask dashboard, DirCon
+EXPOSE 5000 36866
 
 # Run the application
 CMD ["python", "run.py"]

@@ -238,6 +238,187 @@
             padding: 40px;
             color: #888;
         }
+        
+        /* ---- Graph tabs -------------------------------------------------- */
+        
+        .tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 16px;
+            border-bottom: 1px solid #3a3a3a;
+            flex-wrap: wrap;
+        }
+        
+        .tab {
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            color: #888;
+            font-size: 15px;
+            font-family: inherit;
+            padding: 10px 18px;
+            cursor: pointer;
+            /* Tabs are links (each graph has its own URL), but they should still
+               read as tabs, not as prose. */
+            display: inline-block;
+            text-decoration: none;
+            transition: color .15s, border-color .15s;
+        }
+        
+        .tab:hover {
+            color: #c8c8c8;
+        }
+        
+        .tab.active {
+            color: #4CAF50;
+            border-bottom-color: #4CAF50;
+        }
+        
+        .pane {
+            display: none;
+        }
+        
+        .pane.active {
+            display: block;
+        }
+        
+        /* ---- Heart graphs ------------------------------------------------ */
+        
+        .graph-panel {
+            background: #2a2a2a;
+            border-radius: 8px;
+            padding: 10px;
+            margin-bottom: 16px;
+        }
+        
+        .graph-header {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            flex-wrap: wrap;
+            padding: 2px 4px 8px;
+            font-size: 13px;
+            color: #888;
+        }
+        
+        .stepper {
+            display: flex;
+            align-items: center;
+            gap: 2px;
+        }
+        
+        .stepper-label {
+            color: #b0b0b0;
+            margin-right: 4px;
+        }
+        
+        .step-btn {
+            background: transparent;
+            border: none;
+            color: #4CAF50;
+            font-family: inherit;
+            font-size: 16px;
+            line-height: 1;
+            width: 24px;
+            height: 24px;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        
+        .step-btn:hover:not(:disabled) {
+            background: #3a3a3a;
+        }
+        
+        .step-btn:disabled {
+            color: #444;
+            cursor: default;
+        }
+        
+        .step-value {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-weight: 600;
+            color: #e0e0e0;
+            min-width: 44px;
+            text-align: center;
+        }
+        
+        .graph-spacer {
+            margin-left: auto;
+        }
+        
+        .readout {
+            display: flex;
+            gap: 18px;
+            flex-wrap: wrap;
+            align-items: baseline;
+            padding: 6px 4px 10px;
+            font-size: 13px;
+        }
+        
+        .ro-label {
+            color: #888;
+            margin-right: 5px;
+        }
+        
+        .ro-value {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-weight: 600;
+            font-size: 16px;
+            color: #e0e0e0;
+        }
+        
+        .ro-unit {
+            color: #777;
+            margin-left: 3px;
+        }
+        
+        .graph-canvas-wrap {
+            position: relative;
+            width: 100%;
+            height: 500px;
+        }
+        
+        .graph-canvas-wrap canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            border-radius: 6px;
+        }
+        
+        .graph-empty {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            color: #777;
+            font-size: 14px;
+            line-height: 1.6;
+            white-space: pre-line;
+            pointer-events: none;
+        }
+        
+        .legend {
+            display: flex;
+            gap: 14px;
+            flex-wrap: wrap;
+            padding: 0 4px 8px;
+            font-size: 12px;
+            color: #888;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        
+        .legend-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+        }
     </style>
 </head>
 <body>
@@ -249,28 +430,134 @@
             <span id="status-text">Connecting...</span>
             <div class="device-status" id="device-status"></div>
         </div>
-        
-        <div class="controls">
-            <div class="control-group">
-                <label for="time-window">Time Window</label>
-                <select id="time-window">
-                    <option value="1">1 minute</option>
-                    <option value="5" selected>5 minutes</option>
-                    <option value="60">60 minutes</option>
-                </select>
+
+        <!-- Tabs are links so each graph has a URL (#beats, #ecg, ...) that can
+             be bookmarked or sent on; the hash is applied on load. -->
+        <nav class="tabs" id="graph-tabs">
+            <a class="tab active" href="#live" data-pane="live">Live</a>
+            <a class="tab" href="#ecg" data-pane="ecg">ECG</a>
+            <a class="tab" href="#beats" data-pane="beats">Beats</a>
+            <a class="tab" href="#trends" data-pane="trends">Trends</a>
+            <a class="tab" href="#rmssd" data-pane="rmssd">RMSSD</a>
+        </nav>
+
+        <!-- Live: the existing sensor dashboard -->
+        <div class="pane active" id="pane-live">
+            <div class="controls">
+                <div class="control-group">
+                    <label for="time-window">Time Window</label>
+                    <select id="time-window">
+                        <option value="1">1 minute</option>
+                        <option value="5" selected>5 minutes</option>
+                        <option value="60">60 minutes</option>
+                    </select>
+                </div>
+                
+                <div class="control-group">
+                    <label>Current Values</label>
+                    <div class="current-values" id="current-values">
+                        <!-- Current values will be generated dynamically from metrics config -->
+                    </div>
+                </div>
             </div>
             
-            <div class="control-group">
-                <label>Current Values</label>
-                <div class="current-values" id="current-values">
-                    <!-- Current values will be generated dynamically from metrics config -->
+            <div id="plotly-chart" class="loading">Loading chart...</div>
+        </div>
+
+        <!-- ECG: the scrolling strip, newest at the right edge -->
+        <div class="pane" id="pane-ecg">
+            <div class="graph-panel">
+                <div class="readout" data-readout></div>
+                <div class="graph-header">
+                    <div class="stepper" id="ecg-window-stepper">
+                        <span class="stepper-label">Width</span>
+                        <button class="step-btn" data-step="-1">&minus;</button>
+                        <span class="step-value" id="ecg-window-value">10 RR</span>
+                        <button class="step-btn" data-step="1">+</button>
+                    </div>
+                    <div class="graph-spacer"></div>
+                    <span id="ecg-hint">Tap the plot to freeze</span>
+                </div>
+                <div class="graph-canvas-wrap">
+                    <canvas id="ecg-canvas"></canvas>
+                    <div class="graph-empty" id="ecg-empty">ECG starting…</div>
                 </div>
             </div>
         </div>
-        
-        <div id="plotly-chart" class="loading">Loading chart...</div>
+
+        <!-- Beats: superposed complexes -->
+        <div class="pane" id="pane-beats">
+            <div class="graph-panel">
+                <div class="readout" data-readout></div>
+                <div class="graph-header">
+                    <div class="stepper" id="beats-stepper">
+                        <span class="stepper-label">Beats</span>
+                        <button class="step-btn" data-step="-1">&minus;</button>
+                        <span class="step-value" id="beats-limit-value">64</span>
+                        <button class="step-btn" data-step="1">+</button>
+                    </div>
+                    <div class="graph-spacer"></div>
+                    <span id="beats-count">showing 0 of 0</span>
+                </div>
+                <div class="graph-canvas-wrap">
+                    <canvas id="beats-canvas"></canvas>
+                    <div class="graph-empty" id="beats-empty">Waiting for beats…
+(the sensor's R-R clock draws each wave)</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Trends: HR and both RMSSDs over a 1-60 minute window -->
+        <div class="pane" id="pane-trends">
+            <div class="graph-panel">
+                <div class="readout" data-readout></div>
+                <div class="graph-header">
+                    <div class="stepper" id="trends-stepper">
+                        <span class="stepper-label">Width</span>
+                        <button class="step-btn" data-step="-1">&minus;</button>
+                        <span class="step-value" id="trends-width-value">10 min</span>
+                        <button class="step-btn" data-step="1">+</button>
+                    </div>
+                </div>
+                <div class="legend">
+                    <span class="legend-item"><span class="legend-dot" style="background:#4CAF50"></span>HR</span>
+                    <span class="legend-item"><span class="legend-dot" style="background:#FF9800"></span>RMSSD30</span>
+                    <span class="legend-item"><span class="legend-dot" style="background:#64B5F6"></span>RMSSD300</span>
+                </div>
+                <div class="graph-canvas-wrap">
+                    <canvas id="trends-canvas"></canvas>
+                    <div class="graph-empty" id="trends-empty">Waiting for beats…</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- RMSSD: the exponential tile panel -->
+        <div class="pane" id="pane-rmssd">
+            <div class="graph-panel">
+                <div class="readout" data-readout></div>
+                <div class="graph-header">
+                    <div class="stepper" id="rmssd-width-stepper">
+                        <span class="stepper-label">Window</span>
+                        <button class="step-btn" data-step="-1">&minus;</button>
+                        <span class="step-value" id="rmssd-width-value">8min</span>
+                        <button class="step-btn" data-step="1">+</button>
+                    </div>
+                    <div class="stepper" id="rmssd-side-stepper">
+                        <span class="stepper-label">Tiles</span>
+                        <button class="step-btn" data-step="-1">&minus;</button>
+                        <span class="step-value" id="rmssd-side-value">4&times;4</span>
+                        <button class="step-btn" data-step="1">+</button>
+                    </div>
+                </div>
+                <div class="graph-canvas-wrap">
+                    <canvas id="rmssd-canvas"></canvas>
+                    <div class="graph-empty" id="rmssd-empty">RMSSD panel warming up…</div>
+                </div>
+            </div>
+        </div>
     </div>
     
+    <script src="{{ url_for('static', filename='js/heart.js') }}"></script>
     <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
 </body>
 </html>

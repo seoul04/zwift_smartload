@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   z_relay_server:
     build:
@@ -13,9 +11,10 @@ services:
     devices:
       - /dev/ttyACM0:/dev/ttyACM0
     
-    # Port mapping
-    ports:
-      - "5000:5000"
+    # Host networking: Zwift discovers the DirCon server through mDNS multicast,
+    # which does not cross Docker's bridge network. Dashboard on :5000,
+    # DirCon on :36866.
+    network_mode: host
     
     # Volume mounts for config and logs
     volumes:
@@ -25,9 +24,6 @@ services:
     # Environment variables (optional, can override config.conf settings)
     environment:
       - PYTHONUNBUFFERED=1
-    
-    # Network mode (optional - use host network if you need direct device access)
-    # network_mode: host
     
     # Privileged mode may be needed for serial port access
     privileged: true

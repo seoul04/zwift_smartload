@@ -3,6 +3,7 @@ Flask application for Zwift data visualization server.
 """
 import logging
 import os
+import uuid
 from datetime import datetime
 from typing import Dict, List, Optional
 import time
@@ -13,6 +14,8 @@ import tomllib
 from flask import Flask, jsonify, render_template, request
 
 from .data_buffer import DataBuffer
+from .dircon import DirconServer, DongleIdentity, MdnsAdvertiser, SensorState, build_device
+from .heart import HeartState
 from .serial_reader import SerialReader
 
 
@@ -37,12 +40,15 @@ app = Flask(
 # Global instances
 data_buffer: DataBuffer = None
 serial_reader: SerialReader = None
+heart_state: Optional[HeartState] = None
+dircon_server: Optional[DirconServer] = None
+mdns_advertiser: Optional[MdnsAdvertiser] = None
 
-# Device status tracking (RSSI and last seen timestamp)
+# Device status tracking (RSSI, battery, and last seen timestamp)
 device_status = {
-    'hr': {'rssi': None, 'last_seen_ms': None},
-    'cp': {'rssi': None, 'last_seen_ms': None},
-    'ftms': {'rssi': None, 'last_seen_ms': None}
+    'hr': {'rssi': None, 'battery': None, 'last_seen_ms': None},
+    'cp': {'rssi': None, 'battery': None, 'last_seen_ms': None},
+    'ftms': {'rssi': None, 'battery': None, 'last_seen_ms': None}
 }
 
 
@@ -87,9 +93,108 @@ def load_metrics_config() -> Dict:
     return result
 
 
+# Interfaces that never carry the LAN identity we want to present to Zwift.
+_VIRTUAL_IFACES = ('lo', 'docker0', 'br-', 'veth', 'virbr', 'tun', 'tap', 'wg')
+
+
+def _sysfs_mac() -> Optional[str]:
+    """Read a real NIC address straight from sysfs.
+
+    uuid.getnode() shells out to `ip` or `ifconfig`, and the server image ships
+    neither. Python then falls back to a random address with the multicast bit
+    set, so every container start advertises a NEW identity (e.g. 9B:95:... then
+    C1:6A:...). Zwift pairs by that address, so it keeps retrying a device that
+    no longer exists. sysfs is always mounted and needs no tools.
+    """
+    try:
+        names = os.listdir('/sys/class/net')
+    except OSError:
+        return None
+    # Physical ethernet/wifi first: a stable identity should not ride on a
+    # bridge that Docker recreates.
+    def rank(name: str) -> int:
+        if name.startswith(('en', 'eth', 'wl', 'wlan')):
+            return 0
+        return 1
+    for name in sorted(names, key=rank):
+        if name.startswith(_VIRTUAL_IFACES):
+            continue
+        try:
+            with open(f'/sys/class/net/{name}/address', encoding='ascii') as f:
+                mac = f.read().strip().upper()
+        except OSError:
+            continue
+        if len(mac.split(':')) == 6 and mac != '00:00:00:00:00:00':
+            return mac
+    return None
+
+
+def default_mac_address() -> str:
+    stable = _sysfs_mac()
+    if stable:
+        return stable
+    node = uuid.getnode()
+    return ':'.join(f"{(node >> shift) & 0xFF:02X}" for shift in range(40, -1, -8))
+
+
+def init_dircon(dircon_config: Dict):
+    """Start the DirCon server and its mDNS advertisement so Zwift can pair without Companion."""
+    global dircon_server, mdns_advertiser
+
+    if not dircon_config.get('enabled', False):
+        logger.info("DirCon disabled")
+        return
+
+    if not dircon_config.get('log_frames', False):
+        logging.getLogger('src.dircon').setLevel(logging.INFO)
+
+    state = SensorState(stale_timeout_s=float(dircon_config.get('stale_timeout_s', 3)))
+    # Renamed to the dongle's own name (Z-Relay-XXXX) once it reports it
+    device = build_device('Z-Relay', int(dircon_config.get('port', 36866)))
+    devices = [device]
+
+    forward_control = dircon_config.get('forward_control', False)
+
+    def on_control(cmd):
+        # When forwarding, the dongle reports the grade itself with a "sim" line
+        if not forward_control and cmd.grade is not None and data_buffer is not None:
+            data_buffer.add_data_point('sim_grade', data_buffer.latest_timestamp_ms, float(cmd.grade))
+
+    bind_ip = dircon_config.get('bind_ip', '0.0.0.0')
+    dircon_server = DirconServer(
+        devices, state,
+        bind_ip=bind_ip,
+        notify_interval_s=float(dircon_config.get('notify_interval_s', 1.0)),
+        notify_subscribed_only=dircon_config.get('notify_subscribed_only', True),
+        on_control=on_control,
+        command_sender=serial_reader.write_line if forward_control else None,
+        control_timeout_s=float(dircon_config.get('control_timeout_s', 2.0)),
+    )
+    if not dircon_server.start():
+        dircon_server = None
+        return
+    serial_reader.raw_listeners.append(dircon_server.on_serial_message)
+
+    mdns_advertiser = MdnsAdvertiser(devices, mac_address=default_mac_address(), ip=bind_ip)
+    identity = DongleIdentity(
+        device, mdns_advertiser,
+        send_line=serial_reader.write_line,
+        fallback_mac=default_mac_address(),
+        name=dircon_config.get('name'),
+        mac_address=dircon_config.get('mac_address'),
+        timeout_s=float(dircon_config.get('identity_timeout_s', 15)),
+        # Off unless the firmware is known to read serial input. Firmware
+        # without serial_cmd.c never drains what is written, and the backed-up
+        # CDC endpoint silences the whole stream while the port stays open.
+        probe=bool(dircon_config.get('probe_identity', False)),
+    )
+    serial_reader.raw_listeners.append(identity.on_serial_message)
+    identity.start()
+
+
 def init_app():
     """Initialize the application components."""
-    global data_buffer, serial_reader
+    global data_buffer, serial_reader, heart_state
     
     # Prevent double initialization
     if serial_reader is not None and serial_reader.running:
@@ -102,6 +207,19 @@ def init_app():
     max_minutes = config.get('buffer', {}).get('max_minutes', 60)
     data_buffer = DataBuffer(max_minutes=max_minutes)
     logger.info(f"Data buffer initialized with {max_minutes} minute capacity")
+
+    # Heart graphs (ECG, beats, trends, RMSSD): fed from the same serial lines,
+    # through the raw listener so the R-R batch arrives whole.
+    heart_cfg = config.get('heart', {})
+    heart_state = HeartState(fs_hz=float(heart_cfg.get('fs_hz', 130)))
+    heart_state.set_ecg_window(float(heart_cfg.get('ecg_window_rr', 10)))
+    heart_state.set_trend_width(int(heart_cfg.get('trend_width_s', 600)))
+    heart_state.set_beats_limit(int(heart_cfg.get('beats_limit', 64)))
+    heart_state.set_rmssd_config(
+        width_seconds=int(heart_cfg.get('rmssd_width_s', 480)),
+        side=int(heart_cfg.get('rmssd_side', 4)),
+    )
+    logger.info("Heart graphs initialized")
     
     # Initialize serial reader
     serial_port = config.get('dongle', {}).get('serial', '/dev/ttyACM0')
@@ -120,14 +238,28 @@ def init_app():
                     try:
                         data = serial_reader.data_queue.get(timeout=0.1)
                         if data:
-                            # Check for device RSSI events
+                            # Check for device events
                             event = data.get('event')
-                            if event == 'device_rssi':
+                            if event == 'device_seen':
+                                # Liveness only: a device can report data
+                                # without ever carrying an RSSI or a battery.
+                                device = data.get('device')
+                                timestamp_ms = data.get('timestamp_ms')
+                                if device in device_status and timestamp_ms is not None:
+                                    device_status[device]['last_seen_ms'] = timestamp_ms
+                            elif event == 'device_rssi':
                                 device = data.get('device')
                                 rssi = data.get('rssi')
                                 timestamp_ms = data.get('timestamp_ms')
                                 if device and rssi is not None:
                                     device_status[device]['rssi'] = rssi
+                                    device_status[device]['last_seen_ms'] = timestamp_ms
+                            elif event == 'device_battery':
+                                device = data.get('device')
+                                battery = data.get('battery')
+                                timestamp_ms = data.get('timestamp_ms')
+                                if device and battery is not None:
+                                    device_status[device]['battery'] = battery
                                     device_status[device]['last_seen_ms'] = timestamp_ms
                             else:
                                 # Process metric data
@@ -149,6 +281,12 @@ def init_app():
     data_queue = queue.Queue()
     serial_reader.data_queue = data_queue
     
+    init_dircon(config.get('dircon', {}))
+    
+    # The heart graphs see every parsed line, whole: an R-R batch must not be
+    # split, and the raw listener is called before the metric queue is filled.
+    serial_reader.raw_listeners.append(heart_state.on_message)
+
     # Start serial reader
     serial_reader.start()
     
@@ -166,38 +304,49 @@ def index():
     return render_template('index.html')
 
 
+def _serialize_buffer_data(data: Dict[str, List]) -> Dict:
+    result = {}
+    for metric, points in data.items():
+        result[metric] = {
+            'timestamps_ms': [ts_ms for ts_ms, _ in points],
+            'values': [val for _, val in points],
+        }
+    return result
+
+
 @app.route('/api/data')
 def get_data():
     """
     Get data for the specified time window.
-    
+
     Query parameters:
         window: Time window in minutes (1, 5, or 60). Default: 5
+        since_ms: If set, return only points with timestamp_ms > since_ms (delta).
+                  Omit for a full snapshot of the current window.
     """
     window = request.args.get('window', '5', type=int)
-    
+    since_ms = request.args.get('since_ms', type=int)
+
     # Validate window
     if window not in [1, 5, 60]:
         window = 5
-    
+
     if data_buffer is None:
         return jsonify({'error': 'Data buffer not initialized'}), 500
-    
-    # Get data for the window
-    data = data_buffer.get_data_for_window(window)
-    
-    # Convert to format suitable for frontend
-    result = {}
-    for metric, points in data.items():
-        result[metric] = {
-            'timestamps': [ts.isoformat() for ts, _ in points],
-            'values': [val for _, val in points]
-        }
+
+    if since_ms is not None:
+        raw = data_buffer.get_data_delta(window, since_ms)
+        delta = True
+    else:
+        raw = data_buffer.get_data_for_window(window)
+        delta = False
 
     return jsonify({
-        'data': result,
+        'data': _serialize_buffer_data(raw),
         'window_minutes': window,
-        'timestamp': datetime.now().isoformat()
+        'latest_timestamp_ms': data_buffer.latest_timestamp_ms,
+        'delta': delta,
+        'timestamp': datetime.now().isoformat(),
     })
 
 
@@ -216,6 +365,98 @@ def get_metrics_config():
     """Get metrics configuration for the frontend."""
     config = load_metrics_config()
     return jsonify({'metrics_config': config})
+
+
+@app.route('/api/heart/status')
+def get_heart_status():
+    """
+    What the heart graphs have accumulated.
+
+    Counters rather than values: enough for the page to show whether a strap is
+    reporting ECG, R–R, or only bpm, and why a panel may still be empty.
+    """
+    if heart_state is None:
+        return jsonify({'error': 'Heart state not initialized'}), 500
+    return jsonify(heart_state.status())
+
+
+@app.route('/api/heart/ecg')
+def get_heart_ecg():
+    """
+    The scrolling ECG strip: the `window` mean-RRs of samples ending at the playhead.
+
+    `frozen=1` keeps the playback clock with the data but returns no frame, so a
+    paused strip resumes live instead of sliding to catch up.
+    """
+    if heart_state is None:
+        return jsonify({'error': 'Heart state not initialized'}), 500
+    frozen = request.args.get('frozen') in ('1', 'true')
+    frame = heart_state.ecg_frame(frozen=frozen)
+    if frame is None:
+        return '', 204
+    return jsonify(frame)
+
+
+@app.route('/api/heart/beats')
+def get_heart_beats():
+    """The beats stack: normalised waves on a shared time axis."""
+    if heart_state is None:
+        return jsonify({'error': 'Heart state not initialized'}), 500
+    return jsonify(heart_state.beats_frame())
+
+
+@app.route('/api/heart/trends')
+def get_heart_trends():
+    """Heart rate and both RMSSDs over the selected 1-60 minute window."""
+    if heart_state is None:
+        return jsonify({'error': 'Heart state not initialized'}), 500
+    return jsonify(heart_state.trend_frame())
+
+
+@app.route('/api/heart/rmssd')
+def get_heart_rmssd():
+    """The exponential RMSSD panel: tiles of RMSSD over time and window length."""
+    if heart_state is None:
+        return jsonify({'error': 'Heart state not initialized'}), 500
+    return jsonify(heart_state.rmssd_frame())
+
+
+@app.route('/api/heart/config', methods=['POST'])
+def set_heart_config():
+    """
+    Retune the heart panels, one control per request.
+
+    Query parameters (all optional, only the ones present are applied):
+        ecg_window:   ECG strip width, in mean RRs
+        trend_width:  trends window, seconds
+        beats_limit:  beats drawn in the stack
+        rmssd_width:  RMSSD panel span, seconds
+        rmssd_side:   RMSSD tiles per side
+        reset:        "1" to drop every accumulated beat
+    """
+    if heart_state is None:
+        return jsonify({'error': 'Heart state not initialized'}), 500
+
+    if request.args.get('reset') in ('1', 'true'):
+        heart_state.reset()
+        return jsonify(heart_state.status())
+
+    try:
+        if request.args.get('ecg_window') is not None:
+            heart_state.set_ecg_window(request.args.get('ecg_window', type=float))
+        if request.args.get('trend_width') is not None:
+            heart_state.set_trend_width(request.args.get('trend_width', type=int))
+        if request.args.get('beats_limit') is not None:
+            heart_state.set_beats_limit(request.args.get('beats_limit', type=int))
+        if request.args.get('rmssd_width') is not None or request.args.get('rmssd_side') is not None:
+            heart_state.set_rmssd_config(
+                width_seconds=request.args.get('rmssd_width', type=int),
+                side=request.args.get('rmssd_side', type=int),
+            )
+    except (TypeError, ValueError) as e:
+        return jsonify({'error': f'Bad heart config: {e}'}), 400
+
+    return jsonify(heart_state.status())
 
 
 @app.route('/api/status')
@@ -240,6 +481,7 @@ def get_status():
         devices[device_name] = {
             'connected': is_connected,
             'rssi': status['rssi'],
+            'battery': status['battery'],
             'last_seen_ms': last_seen
         }
     
@@ -247,7 +489,8 @@ def get_status():
         'connected': serial_reader.connected if serial_reader else False,
         'running': serial_reader.running if serial_reader else False,
         'port': serial_reader.port if serial_reader else None,
-        'devices': devices
+        'devices': devices,
+        'dircon': dircon_server.status() if dircon_server else None
     }
     return jsonify(status)
 

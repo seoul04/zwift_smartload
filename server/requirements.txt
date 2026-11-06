@@ -1,3 +1,4 @@
 flask==3.0.0
 plotly==5.18.0
 pyserial==3.5
+zeroconf==0.151.5

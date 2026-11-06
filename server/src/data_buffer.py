@@ -2,7 +2,6 @@
 Data buffer for storing and retrieving time-windowed sensor data.
 """
 import threading
-from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 
@@ -57,32 +56,51 @@ class DataBuffer:
             self.buffers[metric].append((timestamp_ms, value))
             self._cleanup_old_data()
     
-    def get_data_for_window(self, window_minutes: int) -> Dict[str, List[Tuple[datetime, float]]]:
+    def get_data_for_window(self, window_minutes: int) -> Dict[str, List[Tuple[int, float]]]:
         """
         Get data points within the specified time window.
-        
+
         Args:
             window_minutes: Time window in minutes (1, 5, or 60)
-            
+
         Returns:
-            Dictionary mapping metric names to lists of (datetime, value) tuples
-            (timestamps converted to datetime for frontend compatibility)
+            Dictionary mapping metric names to lists of (timestamp_ms, value) tuples
         """
-        window_ms = window_minutes * 60 * 1000  # Convert to milliseconds
+        window_ms = window_minutes * 60 * 1000
         cutoff_timestamp_ms = self.latest_timestamp_ms - window_ms
-        
+        return self._filter_buffers(cutoff_timestamp_ms, since_ms=None)
+
+    def get_data_delta(
+        self, window_minutes: int, since_ms: int
+    ) -> Dict[str, List[Tuple[int, float]]]:
+        """
+        Get data points newer than since_ms that still fall within the time window.
+
+        Args:
+            window_minutes: Time window in minutes (1, 5, or 60)
+            since_ms: Only return points with timestamp_ms strictly greater than this
+
+        Returns:
+            Dictionary mapping metric names to lists of (timestamp_ms, value) tuples
+        """
+        window_ms = window_minutes * 60 * 1000
+        cutoff_timestamp_ms = self.latest_timestamp_ms - window_ms
+        return self._filter_buffers(cutoff_timestamp_ms, since_ms=since_ms)
+
+    def _filter_buffers(
+        self, cutoff_timestamp_ms: int, since_ms: Optional[int]
+    ) -> Dict[str, List[Tuple[int, float]]]:
         result = {}
-        
         with self.lock:
             for metric, data_points in self.buffers.items():
-                # Filter data points within the window
-                filtered = [
-                    (self._ms_to_datetime(ts_ms), val)
-                    for ts_ms, val in data_points
-                    if ts_ms >= cutoff_timestamp_ms
-                ]
+                filtered = []
+                for ts_ms, val in data_points:
+                    if ts_ms < cutoff_timestamp_ms:
+                        continue
+                    if since_ms is not None and ts_ms <= since_ms:
+                        continue
+                    filtered.append((ts_ms, val))
                 result[metric] = filtered
-        
         return result
     
     def _cleanup_old_data(self):
@@ -94,22 +112,6 @@ class DataBuffer:
                 (ts_ms, val) for ts_ms, val in self.buffers[metric]
                 if ts_ms >= cutoff_timestamp_ms
             ]
-    
-    def _ms_to_datetime(self, timestamp_ms: int) -> datetime:
-        """
-        Convert relative timestamp (ms) to datetime for frontend.
-        Uses a base datetime and adds the relative time.
-        
-        Args:
-            timestamp_ms: Timestamp in milliseconds (relative)
-            
-        Returns:
-            datetime object (for frontend compatibility)
-        """
-        # Use a fixed base datetime (e.g., epoch start) and add relative time
-        # This is just for display purposes - the actual time doesn't matter
-        base_datetime = datetime(2024, 1, 1, 0, 0, 0)
-        return base_datetime + timedelta(milliseconds=timestamp_ms)
     
     def get_metrics_list(self) -> List[str]:
         """Get list of available metric names."""

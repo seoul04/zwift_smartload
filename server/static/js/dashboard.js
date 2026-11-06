@@ -5,6 +5,11 @@
 // Configuration
 const UPDATE_INTERVAL = 1000; // milliseconds
 const API_BASE = '';
+// Must match DataBuffer display base (relative dongle ms -> chart time axis)
+const TIMESTAMP_BASE_MS = Date.UTC(2024, 0, 1, 0, 0, 0, 0);
+
+let lastTimestampMs = 0;
+let needsFullDataRefresh = true;
 
 // Metrics configuration (loaded from server)
 let METRIC_CONFIG = {};
@@ -15,10 +20,35 @@ let chartData = {
     config: {responsive: true, displayModeBar: true}
 };
 
-let currentWindow = 5;
+// The Live tab's time window is purely client-side (the server serves whatever
+// range is asked for), so it is remembered in the browser: a reload keeps the
+// range the user picked instead of snapping back to five minutes.
+const WINDOW_STORE_KEY = 'zrelay.live.window';
+
+function storedWindow() {
+    try {
+        const v = parseInt(localStorage.getItem(WINDOW_STORE_KEY), 10);
+        const seen = document.getElementById('time-window');
+        const options = seen ? Array.from(seen.options).map((o) => parseInt(o.value, 10)) : [];
+        // Only honour a value the dropdown can actually show, so a changed
+        // option list cannot leave the select and the chart disagreeing.
+        if (isFinite(v) && options.indexOf(v) >= 0) return v;
+    } catch (e) {
+        // Storage unavailable — fall through to the default.
+    }
+    return 5;
+}
+
+let currentWindow = storedWindow();
 
 // Initialize
 document.addEventListener('DOMContentLoaded', async function() {
+    // The dashboard is one of several tabs; if its pane is not on the page
+    // (e.g. a stripped build) there is nothing here to set up.
+    if (!document.getElementById('plotly-chart')) {
+        return;
+    }
+
     // Check if Plotly is loaded
     if (typeof Plotly === 'undefined') {
         console.error('Plotly library not loaded!');
@@ -311,10 +341,72 @@ function initializeChart() {
 
 function setupEventListeners() {
     // Time window selector
-    document.getElementById('time-window').addEventListener('change', function(e) {
-        currentWindow = parseInt(e.target.value);
-        updateChart();
+    const select = document.getElementById('time-window');
+    if (select) {
+        // Show the remembered range, so the dropdown matches what is plotted
+        // from the very first frame.
+        select.value = String(currentWindow);
+        select.addEventListener('change', function(e) {
+            currentWindow = parseInt(e.target.value);
+            try {
+                localStorage.setItem(WINDOW_STORE_KEY, String(currentWindow));
+            } catch (err) {
+                // No storage available; the choice simply lasts this session.
+            }
+            needsFullDataRefresh = true;
+            lastTimestampMs = 0;
+            updateChart();
+        });
+    }
+}
+
+function msToChartDate(timestampMs) {
+    return new Date(TIMESTAMP_BASE_MS + timestampMs);
+}
+
+function metricSeriesFromPayload(metricPayload) {
+    if (!metricPayload || !metricPayload.timestamps_ms || !metricPayload.values) {
+        return { x: [], y: [] };
+    }
+    return {
+        x: metricPayload.timestamps_ms.map(msToChartDate),
+        y: metricPayload.values,
+    };
+}
+
+function trimTracesToWindow(latestTimestampMs) {
+    if (!latestTimestampMs) {
+        return;
+    }
+    const gd = document.getElementById('plotly-chart');
+    if (!gd || !gd.data) {
+        return;
+    }
+    const cutoffMs = latestTimestampMs - currentWindow * 60 * 1000;
+    const cutoffDate = msToChartDate(cutoffMs);
+    const xUpdates = [];
+    const yUpdates = [];
+    const indices = [];
+
+    gd.data.forEach((trace, index) => {
+        const xs = trace.x;
+        if (!xs || xs.length === 0) {
+            return;
+        }
+        let startIdx = 0;
+        while (startIdx < xs.length && new Date(xs[startIdx]) < cutoffDate) {
+            startIdx++;
+        }
+        if (startIdx > 0) {
+            indices.push(index);
+            xUpdates.push(xs.slice(startIdx));
+            yUpdates.push(trace.y.slice(startIdx));
+        }
     });
+
+    if (indices.length > 0) {
+        Plotly.restyle(gd, { x: xUpdates, y: yUpdates }, indices);
+    }
 }
 
 function startDataUpdates() {
@@ -329,100 +421,90 @@ function startStatusUpdates() {
 
 async function updateChart() {
     try {
-        const response = await fetch(`${API_BASE}/api/data?window=${currentWindow}`);
-        
+        const useDelta = !needsFullDataRefresh && lastTimestampMs > 0;
+        let url = `${API_BASE}/api/data?window=${currentWindow}`;
+        if (useDelta) {
+            url += `&since_ms=${lastTimestampMs}`;
+        }
+
+        const response = await fetch(url);
+
         if (!response.ok) {
             console.error('API request failed:', response.status, response.statusText);
             return;
         }
-        
+
         const result = await response.json();
-        
+
         if (result.error) {
             console.error('API error:', result.error);
             return;
         }
-        
+
         const data = result.data;
-        
-        // Debug: log data structure
-        console.log('Received data:', Object.keys(data).length, 'metrics');
-        Object.keys(data).forEach(metric => {
-            if (data[metric] && data[metric].timestamps) {
-                console.log(`${metric}: ${data[metric].timestamps.length} points`);
-            }
-        });
-        const updates = {
-            x: [],
-            y: []
-        };
-        
-        const indices = [];
-        
-        // Only update metrics that are in the plot (same order as initialization)
         const plotMetrics = Object.keys(METRIC_CONFIG)
             .filter(metric => METRIC_CONFIG[metric].show_in_plot !== false);
-        
-        plotMetrics.forEach((metric, index) => {
-            if (data[metric] && data[metric].timestamps && data[metric].values) {
-                updates.x.push(data[metric].timestamps);
-                updates.y.push(data[metric].values);
+
+        if (needsFullDataRefresh || !result.delta) {
+            const updates = { x: [], y: [] };
+            const indices = [];
+
+            plotMetrics.forEach((metric, index) => {
+                const series = metricSeriesFromPayload(data[metric]);
+                updates.x.push(series.x);
+                updates.y.push(series.y);
                 indices.push(index);
-            } else {
-                // No data for this metric
-                updates.x.push([]);
-                updates.y.push([]);
-                indices.push(index);
-            }
-        });
-        
-        if (indices.length > 0) {
+            });
+
             Plotly.update('plotly-chart', updates, {}, indices);
+            needsFullDataRefresh = false;
+        } else {
+            const extendX = [];
+            const extendY = [];
+            const extendIndices = [];
+
+            plotMetrics.forEach((metric, index) => {
+                const series = metricSeriesFromPayload(data[metric]);
+                if (series.x.length === 0) {
+                    return;
+                }
+                extendX.push(series.x);
+                extendY.push(series.y);
+                extendIndices.push(index);
+            });
+
+            if (extendIndices.length > 0) {
+                Plotly.extendTraces('plotly-chart', { x: extendX, y: extendY }, extendIndices);
+            }
+            trimTracesToWindow(result.latest_timestamp_ms);
         }
-        
-        // Update current values display
-        updateCurrentValues(data);
-        
+
+        if (typeof result.latest_timestamp_ms === 'number') {
+            lastTimestampMs = result.latest_timestamp_ms;
+        }
+
+        updateCurrentValues(data, Boolean(result.delta));
     } catch (error) {
         console.error('Error updating chart:', error);
     }
 }
 
-function updateCurrentValues(data) {
+function updateCurrentValues(data, isDelta) {
     Object.keys(METRIC_CONFIG).forEach(metric => {
         const valueElement = document.getElementById(`value-${metric}`);
         if (valueElement) {
-            if (data[metric] && data[metric].values && data[metric].values.length > 0) {
-                // Get the most recent value
-                const latestValue = data[metric].values[data[metric].values.length - 1];
-                const config = METRIC_CONFIG[metric];
-                
-                // Format the value based on type and unit
+            const values = data[metric] && data[metric].values;
+            if (values && values.length > 0) {
+                const latestValue = values[values.length - 1];
                 let formattedValue;
                 if (typeof latestValue === 'number') {
-                    const unit = config.unit || '';
-                    
-                    // Format based on unit type
-                    if (unit === '') {
-                        // Unitless values (coefficients) - show 2 decimal places
-                        formattedValue = latestValue.toFixed(2);
-                    } else if (unit === '%') {
-                        // Percentages - show 1 decimal place
-                        formattedValue = latestValue.toFixed(1);
-                    } else {
-                        // For metrics with units, show as integer if whole number, else 1 decimal
-                        if (latestValue % 1 === 0) {
-                            formattedValue = Math.round(latestValue).toString();
-                        } else {
-                            formattedValue = Math.round(latestValue * 10) / 10;
-                        }
-                    }
+                    formattedValue = Math.round(latestValue).toString();
                 } else {
                     formattedValue = latestValue;
                 }
-                
+
                 valueElement.textContent = formattedValue;
-            } else {
+            } else if (!isDelta) {
                 valueElement.textContent = '--';
             }
         }
@@ -500,10 +582,27 @@ async function updateStatus() {
                     } else {
                         rssi.textContent = '--';
                     }
+
+                    const battery = document.createElement('span');
+                    battery.className = 'device-rssi';
+                    if (deviceInfo.connected && deviceInfo.battery !== null && deviceInfo.battery !== undefined) {
+                        const level = deviceInfo.battery;
+                        if (level < 20) {
+                            // Alert: low battery
+                            battery.textContent = `${level}% (LOW)`;
+                            battery.style.color = '#ff5252';
+                            name.style.color = '#ff5252';
+                        } else {
+                            battery.textContent = `${level}%`;
+                        }
+                    } else {
+                        battery.textContent = '--';
+                    }
                     
                     deviceItem.appendChild(indicator);
                     deviceItem.appendChild(name);
                     deviceItem.appendChild(rssi);
+                    deviceItem.appendChild(battery);
                     deviceStatusContainer.appendChild(deviceItem);
                 }
             });

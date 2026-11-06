@@ -7,7 +7,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, List, Optional
 
 import serial
 
@@ -57,6 +57,9 @@ class SerialReader:
         self.thread: Optional[threading.Thread] = None
         self.log_file = log_file
         self.log_file_handle = None
+        # Callables receiving every parsed JSON dict (called from the reader thread)
+        self.raw_listeners: List[Callable[[dict], None]] = []
+        self._write_lock = threading.Lock()
     
     @property
     def connected(self) -> bool:
@@ -112,6 +115,26 @@ class SerialReader:
             self.log_file_handle = None
         logger.info("Serial reader stopped")
     
+    def write_line(self, line: str) -> bool:
+        """Send one command line to the dongle; returns False if the port is not open."""
+        with self._write_lock:
+            conn = self.serial_conn
+            if conn is None or not conn.is_open:
+                return False
+            try:
+                conn.write(line.rstrip('\n').encode('utf-8') + b'\n')
+                conn.flush()
+            except serial.SerialTimeoutException:
+                logger.warning("Serial write timed out: the dongle is not "
+                               "reading commands (firmware without serial input?)")
+                return False
+            except (serial.SerialException, OSError) as e:
+                logger.warning(f"Serial write failed: {e}")
+                return False
+        if self.log_file_handle:
+            self.log_file_handle.write(f">> {line.rstrip()}\n")
+        return True
+    
     def _read_loop(self):
         """Main reading loop."""
         while self.running:
@@ -119,6 +142,16 @@ class SerialReader:
                 if self.serial_conn and self.serial_conn.is_open:
                     line = self.serial_conn.readline()
                     if line:
+                        # readline() gives up at the timeout, so a long batch
+                        # can arrive as two reads. Handing either half on would
+                        # throw the message away (unparseable JSON), so a
+                        # fragment waits for its other half here.
+                        if not line.endswith(b'\n'):
+                            self._partial = getattr(self, '_partial', b'') + line
+                            continue
+                        if getattr(self, '_partial', b''):
+                            line = self._partial + line
+                            self._partial = b''
                         self._process_line(line)
                 else:
                     # Ensure port is fully released before reconnecting
@@ -130,11 +163,20 @@ class SerialReader:
                             port=self.port,
                             baudrate=self.baudrate,
                             timeout=1.0,
+                            # A dongle whose CDC endpoint nobody drains must not
+                            # block the writer forever: control commands are
+                            # sent from the DirCon event loop, and an
+                            # unbounded write there wedges every client.
+                            write_timeout=1.0,
                             xonxoff=False,
                             rtscts=False,
                             dsrdtr=False
                         )
-                        self.serial_conn.reset_input_buffer()
+                        # No reset_input_buffer(): it can drop a message that is
+                        # half-delivered at the moment the port opens, which is
+                        # exactly what a reboot leaves behind. Stale bytes are
+                        # harmless — they fail to parse and are skipped.
+                        self._partial = b''
                         logger.info(f"Connected to {self.port}")
                     except serial.SerialException as e:
                         logger.warning(f"Could not connect: {e}. Retrying in 2 seconds.")
@@ -151,9 +193,12 @@ class SerialReader:
         try:
             line = line_bytes.decode('utf-8', errors='replace')
             
-            # Log to file
+            # Log to file. Flushed every line so `tail -f` on the log reflects
+            # what the dongle is saying right now — an unflushed buffer reads as
+            # "the dongle went silent" when in fact data is arriving.
             if self.log_file_handle:
                 self.log_file_handle.write(line.rstrip('\r\n') + '\n')
+                self.log_file_handle.flush()
             
             # Extract and parse JSON
             stripped = line.strip()
@@ -168,7 +213,7 @@ class SerialReader:
             logger.exception(f"Error processing line: {e}")
     
     def _process_json(self, json_str: str):
-        """Parse JSON and queue metrics."""
+        """Parse JSON and queue metrics and device status events."""
         try:
             data = json.loads(json_str)
         except json.JSONDecodeError:
@@ -176,6 +221,12 @@ class SerialReader:
         
         if not isinstance(data, dict):
             return
+        
+        for listener in self.raw_listeners:
+            try:
+                listener(data)
+            except Exception as e:
+                logger.exception(f"Raw listener failed: {e}")
         
         msg_type = data.get('type')
         ts = data.get('ts', 0)
@@ -186,8 +237,35 @@ class SerialReader:
                 self.data_queue.put({'timestamp_ms': ts, 'metric': 'heart_rate', 'value': float(bpm)})
             # Extract RSSI if present
             if data.get('rssi') is not None:
-                self.data_queue.put({'event': 'device_rssi', 'device': 'hr', 'rssi': float(data['rssi']), 'timestamp_ms': ts})
-        
+                self.data_queue.put({
+                    'event': 'device_rssi',
+                    'device': 'hr',
+                    'rssi': float(data['rssi']),
+                    'timestamp_ms': ts
+                })
+            # Extract battery level if present
+            if data.get('battery_level') is not None:
+                self.data_queue.put({
+                    'event': 'device_battery',
+                    'device': 'hr',
+                    'battery': float(data['battery_level']),
+                    'timestamp_ms': ts
+                })
+
+        elif msg_type == 'ecg':
+            # ECG is a second heart-rate stream, not a separate device: a strap
+            # that reports ECG may never send a `hr` line at all (the Movesense
+            # exposes R-R as a per-beat resource), so without this the dashboard
+            # would show no sensor while the trace scrolls perfectly well.
+            self.data_queue.put({'event': 'device_seen', 'device': 'hr', 'timestamp_ms': ts})
+            if data.get('rssi') is not None:
+                self.data_queue.put({
+                    'event': 'device_rssi',
+                    'device': 'hr',
+                    'rssi': float(data['rssi']),
+                    'timestamp_ms': ts
+                })
+
         elif msg_type == 'cp':
             if data.get('power') is not None:
                 self.data_queue.put({'timestamp_ms': ts, 'metric': 'power_meter_power', 'value': float(data['power'])})
@@ -195,7 +273,20 @@ class SerialReader:
                 self.data_queue.put({'timestamp_ms': ts, 'metric': 'power_meter_cadence', 'value': float(data['cadence'])})
             # Extract RSSI if present
             if data.get('rssi') is not None:
-                self.data_queue.put({'event': 'device_rssi', 'device': 'cp', 'rssi': float(data['rssi']), 'timestamp_ms': ts})
+                self.data_queue.put({
+                    'event': 'device_rssi',
+                    'device': 'cp',
+                    'rssi': float(data['rssi']),
+                    'timestamp_ms': ts
+                })
+            # Extract battery level if present
+            if data.get('battery_level') is not None:
+                self.data_queue.put({
+                    'event': 'device_battery',
+                    'device': 'cp',
+                    'battery': float(data['battery_level']),
+                    'timestamp_ms': ts
+                })
         
         elif msg_type == 'ftms':
             if data.get('speed') is not None:
@@ -204,7 +295,13 @@ class SerialReader:
                 self.data_queue.put({'timestamp_ms': ts, 'metric': 'trainer_power', 'value': float(data['power'])})
             # Extract RSSI if present
             if data.get('rssi') is not None:
-                self.data_queue.put({'event': 'device_rssi', 'device': 'ftms', 'rssi': float(data['rssi']), 'timestamp_ms': ts})
+                self.data_queue.put({
+                    'event': 'device_rssi',
+                    'device': 'ftms',
+                    'rssi': float(data['rssi']),
+                    'timestamp_ms': ts
+                })
+            # Note: FTMS packet currently has no battery_level in your sample
         
         elif msg_type == 'sim':
             if data.get('grade') is not None:

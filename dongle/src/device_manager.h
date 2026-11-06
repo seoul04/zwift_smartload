@@ -12,7 +12,6 @@ extern sys_slist_t device_list;
 void device_manager_init(void);
 void print_device_list(void);
 void start_scan(void);
-void start_advertising(const char *device_name);
 void cancel_connection_timeout(struct bt_conn *conn);
 void save_connected_device(struct bt_conn *conn);
 

@@ -7,7 +7,11 @@
 	};
 };
 
-/* Increase CDC ACM TX buffer to accommodate full grade table JSON output (~2500 bytes) */
+/* CDC ACM FIFOs. The defaults (1 KiB each) are too small: a full boot log with
+ * service/characteristic discovery is longer than the TX FIFO, and the class
+ * silently drops whatever does not fit. A full FIFO on the RX side also stops
+ * the OUT transfer from being re-armed, which makes the host's writes time out. */
 &board_cdc_acm_uart {
-	tx-fifo-size = <4096>;
+	tx-fifo-size = <16384>;
+	rx-fifo-size = <4096>;
 };

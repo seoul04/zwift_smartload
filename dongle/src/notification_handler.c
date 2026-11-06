@@ -8,11 +8,179 @@
 #include <stdio.h>
 #include "common.h"
 #include "notification_handler.h"
-#include "gatt_services.h"
 #include "device_manager.h"
+#include "ecg_stream.h"
 
-/* CP data cache for injection into FTMS */
+/* Crank counters of the power meter, for cadence */
 struct cp_cache cached_cp_data = {0};
+
+/* The first notification proves the MTU exchange has settled, which is the only
+ * place the final value can be read without polling. */
+static void log_mtu_once(struct conn_slot *slot, struct bt_conn *conn)
+{
+	if (slot->mtu_logged) {
+		return;
+	}
+
+	slot->mtu_logged = 1;
+	log("Negotiated ATT MTU: %u\n", bt_gatt_get_mtu(conn));
+}
+
+/* Extract RR intervals from an HR Measurement (0x2A37) packet.
+ * Layout: flags, HR (1 or 2 bytes), optional energy expended (bit 3), then
+ * N x uint16 RR in 1/1024 s (bit 4). The offset depends on both flag bits.
+ * Returns the number of intervals written to rr_ms. */
+static int parse_hr_rr(const uint8_t *d, uint16_t length, uint16_t *rr_ms, int max)
+{
+	if (length < 2) {
+		return 0;
+	}
+
+	uint8_t flags = d[0];
+	int off = 1;
+
+	off += (flags & 0x01) ? 2 : 1;   /* heart rate format */
+
+	if (flags & 0x08) {              /* energy expended present */
+		off += 2;
+	}
+
+	if (!(flags & 0x10)) {           /* RR interval present */
+		return 0;
+	}
+
+	int n = 0;
+
+	while (off + 2 <= (int)length && n < max) {
+		uint16_t raw = sys_get_le16(&d[off]);
+
+		/* 1/1024 s -> ms. raw * 1000 / 1024 is raw * 125 / 128, so the
+		 * rounding error stays under 0.5 ms while keeping this integer. */
+		rr_ms[n++] = (uint16_t)(((uint32_t)raw * 1000u + 512u) / 1024u);
+		off += 2;
+	}
+
+	return n;
+}
+
+/* Polar PMD Data frame: [0x00][8-byte ns timestamp][frame type][samples...].
+ * Frame type 0 is uncompressed ECG with 3-byte signed little-endian uV values. */
+static void handle_pmd_data(struct conn_slot *slot, const uint8_t *d, uint16_t length)
+{
+	if (length < 10) {
+		log("[PMD] Short data frame (%u bytes)\n", length);
+		return;
+	}
+
+	if (d[0] != 0x00) {
+		/* Not an ECG measurement frame. */
+		return;
+	}
+
+	if (d[9] != 0x00) {
+		log("[PMD] ECG frame type %u not supported\n", d[9]);
+		return;
+	}
+
+	int count = (length - 10) / 3;
+	int32_t uv[ECG_MAX_SAMPLES];
+
+	if (count > ECG_MAX_SAMPLES) {
+		count = ECG_MAX_SAMPLES;
+	}
+
+	for (int i = 0; i < count; i++) {
+		const uint8_t *p = &d[10 + i * 3];
+		int32_t v = p[0] | (p[1] << 8) | (p[2] << 16);
+
+		if (v & 0x800000) {
+			v -= 0x1000000;  /* sign-extend 24-bit */
+		}
+		uv[i] = v;               /* already microvolts */
+	}
+
+	/* The PMD timestamp is nanoseconds since 2000 and is deliberately ignored:
+	 * emit_ecg keeps a sample clock anchored on the first frame. */
+	emit_ecg(slot, uv, count, 130);
+}
+
+/* Movesense GSP DATA / DATA_PART2 framing. A DATA packet starts a frame and
+ * DATA_PART2 continues it; the continuation carries no length, so the frame is
+ * assembled into the slot buffer and parsed when the next DATA arrives. */
+static void handle_gsp_data(struct conn_slot *slot, const uint8_t *d, uint16_t length)
+{
+	if (length < 2) {
+		return;
+	}
+
+	uint8_t type = d[0];
+	uint8_t ref = d[1];
+
+	if (type == 0x01) {
+		/* Command response: [0x01][ref][payload].
+		 *
+		 * The payload is NOT always a 2-byte HTTP status. The Movesense GSP
+		 * protocol uses two shapes:
+		 *
+		 *   HELLO     -> [0x01][ref]['H']['e']['l']['l']['o']  (7 bytes, ASCII)
+		 *   otherwise -> [0x01][ref][uint16 status BE]          e.g. 0x01FB = 507
+		 *
+		 * Reading "Hello" as a uint16 picks up "He" = 0x6548 = 25928, which
+		 * looks like a fatal HTTP error but is only the greeting. The two are
+		 * unambiguous: a real status is 4 bytes total, the greeting is 7. */
+		if (length == 7 && d[2] == 'H' && d[3] == 'e' && d[4] == 'l' &&
+		    d[5] == 'l' && d[6] == 'o') {
+			log("[GSP] HELLO acknowledged (ref %u)\n", ref);
+			return;
+		}
+
+		if (length >= 4) {
+			/* Big-endian, not little. The stock firmware's 507 error is
+			 * {0x01, 0xFB}, and 507 == 0x01FB only when read big-endian;
+			 * little-endian would give 0xFB01 == 64257. The subscribe
+			 * acknowledgement is 200 == 0x00C8 and would likewise be
+			 * mangled to 0xC800. */
+			uint16_t status = sys_get_be16(&d[2]);
+
+			if (status != GSP_HTTP_OK) {
+				log("[GSP] Command ref %u failed with HTTP %u\n", ref, status);
+			} else {
+				log("[GSP] Command ref %u accepted\n", ref);
+			}
+		}
+		return;
+	}
+
+	if (type == 0x02) {
+		/* A new frame starts. If one is already buffered it never received a
+		 * continuation, so parse what we have before replacing it. */
+		if (slot->gsp_pending && slot->gsp_len > 0) {
+			gsp_parse_frame(slot, slot->gsp_ref, slot->gsp_buf, slot->gsp_len);
+		}
+		slot->gsp_pending = false;
+		slot->gsp_len = 0;
+	} else if (type != 0x03) {
+		return;
+	}
+
+	if (slot->gsp_len + (length - 2) > GSP_BUF_SIZE) {
+		log("[GSP] Frame overflow (%u + %u bytes), dropping\n",
+		    slot->gsp_len, length - 2);
+		slot->gsp_pending = false;
+		slot->gsp_len = 0;
+		return;
+	}
+
+	/* Buffer the SBEM payload without the 2-byte GSP header. */
+	memcpy(&slot->gsp_buf[slot->gsp_len], &d[2], length - 2);
+	slot->gsp_len += length - 2;
+	slot->gsp_ref = ref;
+
+	if (type == 0x02) {
+		/* Remember the frame in case a continuation follows. */
+		slot->gsp_pending = true;
+	}
+}
 
 static int get_battery_level_for_conn(struct bt_conn *conn)
 {
@@ -69,55 +237,76 @@ uint8_t notify_func(struct bt_conn *conn,
 		return BT_GATT_ITER_CONTINUE;
 	}
 
-	/* Get service type from the found index */
-	int svc_type = slot->service_type[sub_idx];
+	/* Route by characteristic UUID: PMD and GSP both live inside a 128-bit
+	 * service, so a service index cannot identify what a notification carries. */
+	enum sub_kind kind = slot->sub_kind[sub_idx];
 
-	if (svc_type == -1) {
-		log("[DEBUG] Service type not found (length=%u, handle=%u)\n", length, params->value_handle);
+	if (kind == SUB_NONE) {
+		log("[DEBUG] Unknown subscription kind (length=%u, handle=%u)\n", length, params->value_handle);
 		return BT_GATT_ITER_CONTINUE;
 	}
 
-	/* Get RSSI - use a cached value since live RSSI requires async callback */
-	/* We'll update it periodically in main loop instead */
+	log_mtu_once(slot, conn);
 
-	if (svc_type == 0) {
-		/* HR service */
+	if (kind == SUB_POLAR_PMD_CONTROL) {
+		ecg_handle_pmd_control_point(data, length);
+	} else if (kind == SUB_POLAR_PMD_DATA) {
+		handle_pmd_data(slot, data, length);
+	} else if (kind == SUB_MOVESENSE_GSP_DATA) {
+		handle_gsp_data(slot, data, length);
+	} else if (kind == SUB_HR_MEASUREMENT) {
 		const uint8_t *hr_data = data;
 		int battery_level = get_battery_level_for_conn(conn);
-		uint8_t flags = hr_data[0];
-		uint8_t hr_format = flags & 0x01;
-		uint16_t heart_rate;
+		uint16_t rr[8];
+		int rr_count = 0;
 
+		/* Bug fix: the flags byte used to be read before the length check. */
 		if (length < 2) {
 			log("[DEBUG] Invalid HR data length: %u\n", length);
 			return BT_GATT_ITER_CONTINUE;
 		}
 
-		if (hr_format == 0) {
-			heart_rate = hr_data[1];
-		} else {
+		uint8_t flags = hr_data[0];
+		uint16_t heart_rate;
+
+		if (flags & 0x01) {
 			if (length < 3) {
 				log("[DEBUG] Invalid HR data length for UINT16: %u\n", length);
 				return BT_GATT_ITER_CONTINUE;
 			}
-			heart_rate = sys_le16_to_cpu(*(uint16_t *)&hr_data[1]);
+			heart_rate = sys_get_le16(&hr_data[1]);
+		} else {
+			heart_rate = hr_data[1];
 		}
 
-		hr_measurement_len = length;
-		memcpy(hr_measurement, data, length);
-		bt_gatt_notify(NULL, &hr_svc.attrs[1], hr_measurement, hr_measurement_len);
+		rr_count = parse_hr_rr(hr_data, length, rr, ARRAY_SIZE(rr));
 
+		/* Track how many consecutive packets lack RR: a strap that never sends
+		 * RR through HRS needs the GSP /Meas/HR fallback. */
+		if (rr_count > 0) {
+			slot->hr_rr_misses = 0;
+		} else if (slot->hr_rr_misses < 255) {
+			slot->hr_rr_misses++;
+		}
+
+		json_begin();
 		json_out("{\"type\":\"hr\",\"ts\":%u,\"bpm\":%u,\"rssi\":%d", k_uptime_get_32(), heart_rate, slot->rssi);
 		json_out_battery_field(battery_level);
+
+		if (rr_count > 0) {
+			/* Integer milliseconds, so the server never needs to know which
+			 * strap produced them. */
+			json_out(",\"rr\":[");
+			for (int i = 0; i < rr_count; i++) {
+				json_out("%s%u", i ? "," : "", rr[i]);
+			}
+			json_out("]");
+		}
 		json_out("}\n");
-	} else if (svc_type == 1) {
-		/* CP service - always relay to Zwift immediately */
+		json_end();
+	} else if (kind == SUB_CP_MEASUREMENT) {
+		/* CP service */
 		int battery_level = get_battery_level_for_conn(conn);
-		cp_measurement_len = length;
-		memcpy(cp_measurement, data, length);
-		bt_gatt_notify(NULL, &cp_svc.attrs[1], cp_measurement, cp_measurement_len);
-		
-		/* Now parse and cache for internal use */
 		last_cp_data_time = k_uptime_get_32();
 		const uint8_t *cp_data = data;
 		
@@ -126,10 +315,7 @@ uint8_t notify_func(struct bt_conn *conn,
 			int16_t power = sys_le16_to_cpu(*(uint16_t *)&cp_data[2]);
 			int offset = 4;
 			
-			/* Cache power */
-			cached_cp_data.power = power;
-			cached_cp_data.timestamp = last_cp_data_time;
-			
+			json_begin();
 			json_out("{\"type\":\"cp\",\"ts\":%u,\"power\":%d,\"flags\":%u,\"rssi\":%d", last_cp_data_time, power, flags, slot->rssi);
 			json_out_battery_field(battery_level);
 			
@@ -185,33 +371,20 @@ uint8_t notify_func(struct bt_conn *conn,
 				}
 			}
 			json_out("}\n");
+			json_end();
 		}
-		
-		/* Send CSC notification if we have crank data */
-		if (cached_cp_data.valid) {
-			csc_measurement[0] = 0x02; /* Crank Revolution Data Present */
-			*(uint16_t *)&csc_measurement[1] = sys_cpu_to_le16(cached_cp_data.last_crank_revs);
-			*(uint16_t *)&csc_measurement[3] = sys_cpu_to_le16(cached_cp_data.last_crank_time);
-			csc_measurement_len = 5;
-			bt_gatt_notify(NULL, &csc_svc.attrs[1], csc_measurement, csc_measurement_len);
-		}
-	} else if (svc_type == 2) {
+	} else if (kind == SUB_FTMS_BIKE_DATA) {
 		/* FTMS Indoor Bike Data */
 		const uint8_t *ftms_data = data;
 		int battery_level = get_battery_level_for_conn(conn);
 		uint16_t flags = 0;
-		bool cp_active = false;
-		int cadence_offset = -1;
-		int power_offset = -1;
 		uint32_t now = k_uptime_get_32();
 		
 		if (length >= 2) {
 			flags = sys_le16_to_cpu(*(uint16_t *)&ftms_data[0]);
 			int offset = 2;
 			
-			/* Check if power meter is active */
-			cp_active = (cached_cp_data.valid && (now - cached_cp_data.timestamp) < CP_TIMEOUT_MS);
-			
+			json_begin();
 			json_out("{\"type\":\"ftms\",\"ts\":%u,\"flags\":%u,\"rssi\":%d", now, flags, slot->rssi);
 			json_out_battery_field(battery_level);
 			
@@ -226,11 +399,7 @@ uint8_t notify_func(struct bt_conn *conn,
 				offset += 2;
 			}
 			
-			cadence_offset = -1;
-			power_offset = -1;
-			
 			if (flags & 0x0004) {
-				cadence_offset = offset;
 				if (length >= offset + 2) {
 					uint16_t ftms_cadence = sys_le16_to_cpu(*(uint16_t *)&ftms_data[offset]);
 					json_out(",\"cadence\":%u", ftms_cadence / 2);
@@ -254,37 +423,34 @@ uint8_t notify_func(struct bt_conn *conn,
 				offset += 2;
 			}
 			
-			/* Extract/inject power */
-			int16_t ftms_power = -1;
 			if (flags & 0x0040) {
-				power_offset = offset;
 				if (length >= offset + 2) {
-					ftms_power = sys_le16_to_cpu(*(uint16_t *)&ftms_data[offset]);
+					int16_t ftms_power = sys_le16_to_cpu(*(uint16_t *)&ftms_data[offset]);
 					json_out(",\"power\":%d", ftms_power);
 				}
 				offset += 2;
 			}
 
 			json_out("}\n");
+			json_end();
 		}
-		/* Rebroadcast FTMS with CP power injection if active */
-		ftms_measurement_len = length;
-		memcpy(ftms_measurement, data, length);
-		
-		/* Inject power meter power if active AND power field already exists */
-		/* Only replace existing power to avoid creating invalid packet structure */
-		if (cp_active && cached_cp_data.power >= 0 && power_offset >= 0 && power_offset + 2 <= ftms_measurement_len) {
-			*(int16_t *)&ftms_measurement[power_offset] = sys_cpu_to_le16(cached_cp_data.power);
+	} else if (kind == SUB_FTMS_TRAINING) {
+		/* FTMS Training Status. Previously unreachable: the service index could
+		 * never be 3, so these packets fell through to the Indoor Bike Data
+		 * branch and were parsed as speed/power. */
+		const uint8_t *ts_data = data;
+
+		if (length >= 1) {
+			json_begin();
+			json_out("{\"type\":\"training_status\",\"ts\":%u,\"flags\":%u",
+				 k_uptime_get_32(), ts_data[0]);
+			if (length >= 2) {
+				json_out(",\"status\":%u", ts_data[1]);
+			}
+			json_out("}\n");
+			json_end();
 		}
-		
-		bt_gatt_notify(NULL, &ftms_svc.attrs[1], ftms_measurement, ftms_measurement_len);
-	} else if (svc_type == 3) {
-		/* FTMS Training Status */
-		log("[DEBUG] FTMS Training Status [%u bytes]\n", length);
-		ftms_training_status_len = length;
-		memcpy(ftms_training_status, data, length);
-		bt_gatt_notify(NULL, &ftms_svc.attrs[3], ftms_training_status, ftms_training_status_len);
-	} else if (svc_type == 4) {
+	} else if (kind == SUB_FTMS_STATUS) {
 		/* FTMS Machine Status */
 		const uint8_t *status_data = data;
 		uint32_t now = k_uptime_get_32();
@@ -292,6 +458,7 @@ uint8_t notify_func(struct bt_conn *conn,
 		if (length >= 1) {
 			uint8_t op_code = status_data[0];
 			
+			json_begin();
 			json_out("{\"type\":\"status\",\"ts\":%u,\"code\":%u", now, op_code);
 			
 			switch (op_code) {
@@ -344,13 +511,10 @@ uint8_t notify_func(struct bt_conn *conn,
 			}
 			
 			json_out("}\n");
+			json_end();
 		} else {
 			log("[DEBUG] FTMS Machine Status [%u bytes]\n", length);
 		}
-		
-		ftms_machine_status_len = length;
-		memcpy(ftms_machine_status, data, length);
-		bt_gatt_notify(NULL, &ftms_svc.attrs[5], ftms_machine_status, ftms_machine_status_len);
 	}
 
 	total_rx_count++;

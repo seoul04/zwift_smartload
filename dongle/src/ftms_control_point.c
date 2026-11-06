@@ -1,4 +1,4 @@
-/* ftms_control_point.c - FTMS Control Point handling */
+/* ftms_control_point.c - FTMS Control Point commands from z_relay_server, forwarded to the trainer */
 
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -7,11 +7,6 @@
 #include <string.h>
 #include "common.h"
 #include "ftms_control_point.h"
-#include "gatt_services.h"
-
-/* Control Point state */
-bool ftms_cp_indicate_enabled = false;
-bool ftms_cp_indicating = false;
 
 /* Grade to resistance conversion: grade -100 -> 0, grade 1900 -> 100 */
 #define GRADE_RESISTANCE(x) MAX(MIN(((x) + 120) / 20, 100), 0)
@@ -19,18 +14,15 @@ bool ftms_cp_indicating = false;
 /* Track if last command was converted from 0x11 to 0x04 */
 static bool last_cmd_was_converted = false;
 
-/* Buffer for Control Point indication responses */
-static uint8_t ftms_cp_response[20];
-static uint16_t ftms_cp_response_len;
-static struct bt_gatt_indicate_params ftms_cp_ind_params;
+/* Opcode of the command being written, as received (before any 0x11 -> 0x04 conversion) */
+static uint8_t ftms_cp_write_opcode;
+
+static int ftms_cp_fail(uint8_t opcode, int err);
 
 /* Buffer for forwarding commands to trainer */
 static uint8_t ftms_cp_write_buf[32];
 static struct bt_gatt_write_params ftms_cp_write_params;
 static bool ftms_cp_write_busy = false;
-
-/* Work item for sending deferred Control Point responses */
-struct k_work ftms_cp_response_work;
 
 const char *ftms_cp_opcode_str(uint8_t opcode)
 {
@@ -50,49 +42,6 @@ const char *ftms_cp_opcode_str(uint8_t opcode)
 	}
 }
 
-void ftms_cp_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
-{
-	ftms_cp_indicate_enabled = (value == BT_GATT_CCC_INDICATE);
-	log("[FTMS CP] CCC changed: indications %s\n", 
-	       ftms_cp_indicate_enabled ? "enabled" : "disabled");
-}
-
-static void ftms_cp_indicate_cb(struct bt_conn *conn,
-				struct bt_gatt_indicate_params *params, uint8_t err)
-{
-	if (err) {
-		log("[FTMS CP] Indication failed (err %d)\n", err);
-	} else {
-		log("[FTMS CP] Indication acknowledged by Zwift\n");
-	}
-}
-
-static void ftms_cp_indicate_destroy(struct bt_gatt_indicate_params *params)
-{
-	log("[FTMS CP] Indication complete\n");
-	ftms_cp_indicating = false;
-}
-
-static void ftms_cp_response_work_handler(struct k_work *work)
-{
-	if (peripheral_conn && ftms_cp_indicate_enabled && !ftms_cp_indicating) {
-		/* Use Attribute 11 (Control Point Value) for indication */
-		ftms_cp_ind_params.attr = &ftms_svc.attrs[11];
-		ftms_cp_ind_params.func = ftms_cp_indicate_cb;
-		ftms_cp_ind_params.destroy = ftms_cp_indicate_destroy;
-		ftms_cp_ind_params.data = ftms_cp_response;
-		ftms_cp_ind_params.len = ftms_cp_response_len;
-		
-		int err = bt_gatt_indicate(peripheral_conn, &ftms_cp_ind_params);
-		if (err) {
-			log("[FTMS CP] Failed to send indication (err %d)\n", err);
-		} else {
-			ftms_cp_indicating = true;
-			log("[FTMS CP] Indication sent, waiting for ACK\n");
-		}
-	}
-}
-
 static void ftms_cp_write_cb(struct bt_conn *conn, uint8_t err,
 			     struct bt_gatt_write_params *params)
 {
@@ -100,42 +49,44 @@ static void ftms_cp_write_cb(struct bt_conn *conn, uint8_t err,
 	
 	if (err) {
 		log("[FTMS CP] Forwarding to trainer failed (err %u)\n", err);
+		ftms_cp_fail(ftms_cp_write_opcode, -EIO);
 	} else {
 		log("[FTMS CP] Forwarding to trainer complete\n");
 	}
 }
 
-ssize_t ftms_control_point_write(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-				 const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
+static void ftms_cp_serial_response(const uint8_t *response, uint16_t length)
 {
-	const uint8_t *cmd = buf;
-	char addr[BT_ADDR_LE_STR_LEN];
+	char hex_str[2 * 20 + 1];
+	int pos = 0;
 
-	if (offset != 0) {
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	for (int i = 0; i < length && pos < sizeof(hex_str) - 2; i++) {
+		pos += snprintf(hex_str + pos, sizeof(hex_str) - pos, "%02x", response[i]);
 	}
+	json_out("{\"type\":\"cp_resp\",\"ts\":%u,\"data\":\"%s\"}\n", k_uptime_get_32(), hex_str);
+}
 
+static int ftms_cp_fail(uint8_t opcode, int err)
+{
+	uint8_t response[3] = { FTMS_CP_RESPONSE_CODE, opcode, FTMS_CP_RESULT_FAILED };
+
+	ftms_cp_serial_response(response, sizeof(response));
+	return err;
+}
+
+int ftms_cp_handle_command(const uint8_t *cmd, uint16_t len)
+{
 	if (len < 1) {
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		return -EINVAL;
 	}
 
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	/* Keep debug log for all commands */
-	log("[FTMS CP] Zwift (%s) -> %s (0x%02x)\n", 
-	       addr, ftms_cp_opcode_str(cmd[0]), cmd[0]);
-
-	/* Store peripheral connection for sending responses back */
-	if (!peripheral_conn) {
-		peripheral_conn = bt_conn_ref(conn);
-		log("[FTMS CP] Stored peripheral connection\n");
-	}
+	log("[FTMS CP] Serial -> %s (0x%02x)\n", ftms_cp_opcode_str(cmd[0]), cmd[0]);
 
 	/* Convert Set Indoor Bike Simulation (0x11) to Set Target Resistance (0x04) */
 	uint8_t converted_cmd[32];
 	const uint8_t *forward_cmd = cmd;
 	uint16_t forward_len = len;
-	last_cmd_was_converted = false;
+	bool converted = false;
 	
 	if (cmd[0] == FTMS_CP_SET_INDOOR_BIKE_SIM && len >= 5) {
 		int16_t wind_speed = sys_le16_to_cpu(*(uint16_t *)&cmd[1]);
@@ -149,7 +100,7 @@ ssize_t ftms_control_point_write(struct bt_conn *conn, const struct bt_gatt_attr
 		converted_cmd[1] = (uint8_t)resistance;
 		forward_cmd = converted_cmd;
 		forward_len = 2;
-		last_cmd_was_converted = true;
+		converted = true;
 		
 		/* Log conversion */
 		uint32_t now = k_uptime_get_32();
@@ -177,19 +128,19 @@ ssize_t ftms_control_point_write(struct bt_conn *conn, const struct bt_gatt_attr
 			}
 		}
 		log("[FTMS CP] ERROR: No trainer connection found (slots: %s)\n", slots_str);
-		return len;
+		return ftms_cp_fail(cmd[0], -ENOTCONN);
 	}
 
 	/* Forward command to trainer */
 	if (len > sizeof(ftms_cp_write_buf)) {
 		log("[FTMS CP] Error: Command too long (%u)\n", len);
-		return len;
+		return ftms_cp_fail(cmd[0], -EMSGSIZE);
 	}
 	
 	/* Check if a write is already in progress */
 	if (ftms_cp_write_busy) {
 		log("[FTMS CP] Write busy, dropping command\n");
-		return len;
+		return ftms_cp_fail(cmd[0], -EBUSY);
 	}
 
 	memcpy(ftms_cp_write_buf, forward_cmd, forward_len);
@@ -201,20 +152,23 @@ ssize_t ftms_control_point_write(struct bt_conn *conn, const struct bt_gatt_attr
 	ftms_cp_write_params.length = forward_len;
 
 	ftms_cp_write_busy = true;
+	last_cmd_was_converted = converted;
+	ftms_cp_write_opcode = cmd[0];
 	int err = bt_gatt_write(trainer_slot->conn, &ftms_cp_write_params);
 	if (err) {
 		ftms_cp_write_busy = false;
 		log("[FTMS CP] Write to trainer failed (err %d)\n", err);
-	} else {
-		char hex_str[96];
-		int pos = 0;
-		for (int i = 0; i < forward_len && pos < sizeof(hex_str) - 3; i++) {
-			pos += snprintf(hex_str + pos, sizeof(hex_str) - pos, "%02x ", forward_cmd[i]);
-		}
-		log("[FTMS CP] Forwarded to trainer [%u bytes]: %s\n", forward_len, hex_str);
+		return ftms_cp_fail(cmd[0], err);
 	}
 
-	return len;
+	char hex_str[96];
+	int pos = 0;
+	for (int i = 0; i < forward_len && pos < sizeof(hex_str) - 3; i++) {
+		pos += snprintf(hex_str + pos, sizeof(hex_str) - pos, "%02x ", forward_cmd[i]);
+	}
+	log("[FTMS CP] Forwarded to trainer [%u bytes]: %s\n", forward_len, hex_str);
+
+	return 0;
 }
 
 uint8_t ftms_cp_indicate_func(struct bt_conn *conn,
@@ -246,34 +200,23 @@ uint8_t ftms_cp_indicate_func(struct bt_conn *conn,
 		       result == 0x03 ? "Invalid Parameter" : result == 0x04 ? "Failed" : "Unknown");
 	}
 
-	/* Forward indication back to Zwift if connected */
-	if (peripheral_conn && ftms_cp_indicate_enabled) {
-		if (length > sizeof(ftms_cp_response)) {
-			log("[FTMS CP] Response too long (%u), truncating\n", length);
-			length = sizeof(ftms_cp_response);
-		}
-		ftms_cp_response_len = length;
-		memcpy(ftms_cp_response, data, length);
-		
-		/* Convert response opcode from 0x04 back to 0x11 if needed */
-		if (last_cmd_was_converted && ftms_cp_response_len >= 3 && 
-		    ftms_cp_response[0] == FTMS_CP_RESPONSE_CODE && 
-		    ftms_cp_response[1] == FTMS_CP_SET_TARGET_RESISTANCE) {
-			ftms_cp_response[1] = FTMS_CP_SET_INDOOR_BIKE_SIM;
-			log("[FTMS CP] Converted response 0x04 -> 0x11 for Zwift\n");
-			last_cmd_was_converted = false;
-		}
-		
-		k_work_submit(&ftms_cp_response_work);
-		log("[FTMS CP] Queued response for forwarding\n");
-	} else if (peripheral_conn && !ftms_cp_indicate_enabled) {
-		log("[FTMS CP] Cannot send indication - CCC not configured\n");
+	uint8_t converted_response[20];
+
+	if (length > sizeof(converted_response)) {
+		log("[FTMS CP] Response too long (%u), truncating\n", length);
+		length = sizeof(converted_response);
+	}
+	memcpy(converted_response, data, length);
+
+	/* Convert response opcode from 0x04 back to 0x11 if needed */
+	if (last_cmd_was_converted && length >= 3 &&
+	    converted_response[0] == FTMS_CP_RESPONSE_CODE &&
+	    converted_response[1] == FTMS_CP_SET_TARGET_RESISTANCE) {
+		converted_response[1] = FTMS_CP_SET_INDOOR_BIKE_SIM;
+		log("[FTMS CP] Converted response 0x04 -> 0x11 for Zwift\n");
+		last_cmd_was_converted = false;
 	}
 
+	ftms_cp_serial_response(converted_response, length);
 	return BT_GATT_ITER_CONTINUE;
-}
-
-void ftms_control_point_init(void)
-{
-	k_work_init(&ftms_cp_response_work, ftms_cp_response_work_handler);
 }

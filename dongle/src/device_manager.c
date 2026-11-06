@@ -36,6 +36,7 @@ void print_device_list(void)
 		count++;
 	}
 
+	json_begin();
 	json_out("{\"type\":\"devices\",\"ts\":%u,\"count\":%d,\"list\":[", now, count);
 	
 	int idx = 0;
@@ -66,6 +67,7 @@ void print_device_list(void)
 		idx++;
 	}
 	json_out("]}\n");
+	json_end();
 }
 
 static void conn_timeout_handler(struct k_work *work)
@@ -92,6 +94,46 @@ void cancel_connection_timeout(struct bt_conn *conn)
 		bt_conn_unref(pending_conn);
 		pending_conn = NULL;
 	}
+}
+
+/* One role per device (trainer > power meter > HR): trainers often also advertise CP */
+static uint8_t primary_role(uint8_t svc_mask)
+{
+	if (svc_mask & 0x04) {
+		return 0x04;
+	}
+	if (svc_mask & 0x02) {
+		return 0x02;
+	}
+	return svc_mask & 0x01;
+}
+
+static struct device_info *find_device(const bt_addr_le_t *addr)
+{
+	struct device_info *dev_info;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&device_list, dev_info, node) {
+		if (!bt_addr_le_cmp(&dev_info->addr, addr)) {
+			return dev_info;
+		}
+	}
+	return NULL;
+}
+
+/* Roles already held by connected (or connecting) devices */
+static uint8_t taken_roles(void)
+{
+	uint8_t roles = 0;
+
+	for (int i = 0; i < MAX_CONNECTIONS; i++) {
+		if (connections[i].conn) {
+			struct device_info *dev = find_device(bt_conn_get_dst(connections[i].conn));
+			if (dev) {
+				roles |= primary_role(dev->svc_mask);
+			}
+		}
+	}
+	return roles;
 }
 
 static bool eir_found(struct bt_data *data, void *user_data)
@@ -227,6 +269,7 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			dev_info->battery_level = -1;
 			dev_info->last_seen = now;
 			dev_info->is_saved = is_saved;
+			dev_info->role_skip_logged = false;
 			dev_info->rssi = rssi;  /* Store RSSI from advertisement */
 			sys_slist_append(&device_list, &dev_info->node);
 			log("Added device: %s (svc_mask=%d, saved=%d)\n", dev_info->name, dev_info->svc_mask, is_saved);
@@ -264,6 +307,14 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			}
 		}
 
+		if (!already_connected && (taken_roles() & primary_role(dev_info->svc_mask))) {
+			if (!dev_info->role_skip_logged) {
+				log("Skipping %s: another device already provides its service\n", dev_info->name);
+				dev_info->role_skip_logged = true;
+			}
+			return;
+		}
+
 		if (!already_connected) {
 			int free_slot = -1;
 			for (int i = 0; i < MAX_CONNECTIONS; i++) {
@@ -280,11 +331,15 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 				/* Clear the slot to ensure clean state for new connection */
 				memset(&connections[free_slot].subscribe_params, 0, 
 				       sizeof(connections[free_slot].subscribe_params));
-				memset(&connections[free_slot].service_type, 0,
-				       sizeof(connections[free_slot].service_type));
+				memset(&connections[free_slot].ccc_disc_params, 0,
+				       sizeof(connections[free_slot].ccc_disc_params));
+				memset(&connections[free_slot].sub_kind, 0,
+				       sizeof(connections[free_slot].sub_kind));
 				connections[free_slot].subscribe_count = 0;
 				connections[free_slot].discover_service_index = 0;
 				connections[free_slot].ftms_control_point_handle = 0;
+				connections[free_slot].polar_pmd_cp_handle = 0;
+				connections[free_slot].movesense_cmd_handle = 0;
 				connections[free_slot].temp_value_handle = 0;
 
 				err = bt_le_scan_stop();
@@ -373,52 +428,6 @@ static void _start_scan_internal(void)
 void start_scan(void)
 {
 	_start_scan_internal();
-}
-
-void start_advertising(const char *device_name)
-{
-	int err;
-	
-	/* Stop scanning first to free up resources for advertising */
-	err = bt_le_scan_stop();
-	if (err && err != -EALREADY) {
-		log("Failed to stop scan for advertising (err %d)\n", err);
-	}
-	
-	/* Stop advertising first if it's already running */
-	err = bt_le_adv_stop();
-	if (err && err != -EALREADY) {
-		log("Failed to stop advertising (err %d)\n", err);
-	}
-	
-	struct bt_data ad[] = {
-		BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-		BT_DATA_BYTES(BT_DATA_UUID16_ALL,
-			BT_BYTES_LIST_LE16(BT_UUID_HRS_VAL),
-			BT_BYTES_LIST_LE16(0x1816),
-			BT_BYTES_LIST_LE16(0x1818),
-			BT_BYTES_LIST_LE16(0x1826)),
-		BT_DATA(BT_DATA_NAME_COMPLETE, (unsigned char *)device_name, strlen(device_name)),
-	};
-
-	struct bt_le_adv_param adv_param = {
-		.options = BT_LE_ADV_OPT_CONN,
-		.interval_min = BT_GAP_ADV_FAST_INT_MIN_1,
-		.interval_max = BT_GAP_ADV_FAST_INT_MAX_1,
-	};
-
-	err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0);
-	if (err) {
-		log("Advertising failed to start (err %d)\n", err);
-		/* If advertising failed, restart scanning */
-		start_scan();
-		return;
-	}
-
-	log("Advertising as '%s' started\n", device_name);
-	
-	/* Restart scanning so saved devices can reconnect while advertising */
-	start_scan();
 }
 
 static void scan_window_timeout_handler(struct k_work *work)

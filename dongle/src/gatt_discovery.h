@@ -11,6 +11,9 @@ uint8_t discover_func(struct bt_conn *conn,
 		      const struct bt_gatt_attr *attr,
 		      struct bt_gatt_discover_params *params);
 
+/* Walks every primary service (logging them), then calls start_discovery(). */
+void start_enumeration(struct bt_conn *conn, int slot_idx);
+
 void start_discovery(struct bt_conn *conn, int slot_idx);
 void start_battery_level_check(struct bt_conn *conn, int slot_idx);
 

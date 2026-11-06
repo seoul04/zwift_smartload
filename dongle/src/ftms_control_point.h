@@ -1,4 +1,4 @@
-/* ftms_control_point.h - FTMS Control Point handling */
+/* ftms_control_point.h - FTMS Control Point commands from z_relay_server, forwarded to the trainer */
 
 #ifndef FTMS_CONTROL_POINT_H_
 #define FTMS_CONTROL_POINT_H_
@@ -19,19 +19,19 @@
 #define FTMS_CP_SET_INDOOR_BIKE_SIM       0x11
 #define FTMS_CP_RESPONSE_CODE             0x80
 
-/* Control Point state */
-extern bool ftms_cp_indicate_enabled;
-extern bool ftms_cp_indicating;
-extern struct k_work ftms_cp_response_work;
+/* FTMS Control Point result codes */
+#define FTMS_CP_RESULT_SUCCESS            0x01
+#define FTMS_CP_RESULT_NOT_SUPPORTED      0x02
+#define FTMS_CP_RESULT_INVALID_PARAMETER  0x03
+#define FTMS_CP_RESULT_FAILED             0x04
 
-/* Functions */
-void ftms_control_point_init(void);
 const char *ftms_cp_opcode_str(uint8_t opcode);
 
-/* GATT callbacks */
-void ftms_cp_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value);
-ssize_t ftms_control_point_write(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-				 const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
+/* Convert (0x11 -> 0x04) and forward a Control Point command to the trainer.
+ * Returns 0 if the write to the trainer was started, negative errno otherwise.
+ * The trainer's response is printed as a "cp_resp" JSON line, and failures are
+ * reported the same way with result FTMS_CP_RESULT_FAILED. */
+int ftms_cp_handle_command(const uint8_t *cmd, uint16_t len);
 
 /* Indication callback for Control Point responses from trainer */
 uint8_t ftms_cp_indicate_func(struct bt_conn *conn,

@@ -1,19 +1,19 @@
 # Fitness Sensor Relay — Project Description 🚴‍♂️
 
 ## Summary ✨
-This project implements an intermediate Bluetooth Low Energy (BLE) relay that sits between fitness sensors (HR strap, power meter pedals, smart trainer) and Zwift. It acts as both a BLE central (connecting to sensors) and peripheral (advertising to Zwift Companion app), forwarding Heart Rate, Cycling Power, and Fitness Machine data. This enables debugging BLE traffic and works around unreliable Bluetooth in containerized environments. Connected sensors are automatically saved to non-volatile storage (NVS) and given priority reconnection access on boot.
+This project implements an intermediate Bluetooth Low Energy (BLE) relay that sits between fitness sensors (HR strap, power meter pedals, smart trainer) and Zwift. It is a BLE central / GATT client only: it connects to the sensors and reports Heart Rate, Cycling Power, and Fitness Machine data as JSON lines on the USB serial port, where z_relay_server turns them into a DirCon device for Zwift. The dongle does not advertise. This enables debugging BLE traffic and works around unreliable Bluetooth in containerized environments. Connected sensors are automatically saved to non-volatile storage (NVS) and given priority reconnection access on boot.
 
 ## Motivation 💡
-I observed intermittent resistance drops on a TruTrainer smartroller during specific slopes/speeds. Because Zwift runs under Wine in a Docker container on Manjaro, direct Bluetooth access is unreliable. Using a BLE relay allows the Zwift Companion app to connect to the relay instead of the sensors, enabling observation and debugging of the BLE traffic.
+I observed intermittent resistance drops on a TruTrainer smartroller during specific slopes/speeds. Because Zwift runs under Wine in a Docker container on Manjaro, direct Bluetooth access is unreliable. Using a BLE relay and handing the data to Zwift over the network (DirCon) avoids Bluetooth in the container entirely, and enables observation and debugging of the BLE traffic.
 
 ## Pipeline
-Zwift <-> Companion App <-> Fitness Relay (this firmware) <-> Sensors (Polar H10, Favero Assioma, TruTrainer)
+Zwift <-> z_relay_server (DirCon over TCP) <-> USB serial (JSON lines both ways) <-> Fitness Relay (this firmware) <-> Sensors (Polar H10, Favero Assioma, TruTrainer)
 
 ## Hardware & Software Requirements 🔧
 - Hardware: nRF52840-based dongle (e.g., `nrf52840dongle_nrf52840`)
 - Toolchain: Zephyr SDK v4.2.99 / Nordic NCS v3.2.1, `west` build tool, and `cmake`
-- Zephyr features used: Bluetooth dual role (central + peripheral), GATT client/server, notifications, multiple simultaneous connections, NVS (Non-Volatile Storage)
-- Key configs: `CONFIG_BT_MAX_CONN=4`, `CONFIG_HEAP_MEM_POOL_SIZE=2048`, `CONFIG_LOG_BUFFER_SIZE=2048`, `CONFIG_NVS=y`
+- Zephyr features used: Bluetooth central, GATT client, notifications/indications, multiple simultaneous connections, NVS (Non-Volatile Storage), USB CDC ACM
+- Key configs: `CONFIG_BT_MAX_CONN=3`, `CONFIG_HEAP_MEM_POOL_SIZE=2048`, `CONFIG_LOG_BUFFER_SIZE=2048`, `CONFIG_NVS=y`
 - Storage: Uses existing 16KB storage_partition at 0xdc000 for device persistence
 
 ## Build & Run ⚙️
@@ -22,14 +22,13 @@ Zwift <-> Companion App <-> Fitness Relay (this firmware) <-> Sensors (Polar H10
 3. Monitor serial logs using nRF Serial extension
 
 ## Notes & Tips 📝
-- The firmware advertises itself as both HR and Cycling Power service so the companion app recognizes all sensors.
-- Supports up to 4 simultaneous connections (HR strap + left/right pedals + trainer).
+- The firmware does not advertise; z_relay_server presents all sensors to Zwift as one DirCon device named after the dongle (`{"cmd":"info"}` returns name and address).
+- Supports up to 3 simultaneous connections, one device per role (trainer, power meter, heart rate).
 - Only connects to devices with known names (not MAC addresses) to avoid connecting to random devices.
 - **NVS Persistence**: Connected sensors are automatically saved to flash memory with up to 4 devices persisted across reboots.
 - **Exclusive Reconnection Window**: On boot, saved devices get 6-minute exclusive window to reconnect before accepting new devices.
 - Device list JSON output includes "saved":true/false field to indicate persistence status.
 - Connected devices marked with "*" in periodic device list printout.
-- Advertising automatically restarts when Zwift disconnects, enabling reconnection.
 - Dynamic allocations used for device list management.
 - A periodic timer prints the current device list every 30 seconds for easier inspection.
 - Note: build and flashing performed using external Nordic tools (nrfutil or Nordic Programmer GUI); `west flash` may not work.
@@ -40,14 +39,14 @@ Zwift <-> Companion App <-> Fitness Relay (this firmware) <-> Sensors (Polar H10
 - **Heart Rate Service (0x180D)**: Full support
   - Discovers and subscribes to HR Measurement (0x2A37)
   - Parses BPM from notifications
-  - Forwards to local GATT service for Zwift
+  - Prints it as a JSON line
 
 - **Cycling Power Service (0x1818)**: Full support
   - Discovers and subscribes to CP Measurement (0x2A63)
   - Parses power, pedal balance, crank revolution data
-  - Forwards to local GATT service
+  - Prints it as a JSON line
 
-- **Multiple Simultaneous Connections**: Up to 4 devices
+- **Multiple Simultaneous Connections**: Up to 3 devices
   - Tracks service type per subscription (HR vs CP)
   - Correct data routing even when device only has subset of services
   - Connection slot management
@@ -64,15 +63,15 @@ Zwift <-> Companion App <-> Fitness Relay (this firmware) <-> Sensors (Polar H10
 
 - **Connection Handling**:
   - Scan restart error handling (-EALREADY)
-  - Advertising restart after peripheral disconnect (Zwift reconnection)
+  - Scan restart after a sensor disconnects
   - Proper address comparison using `bt_conn_get_dst()`
 
 - **Fitness Machine Service (0x1826)**: Full support
   - Discovers and subscribes to Indoor Bike Data (0x2AD2)
   - Parses speed, cadence, power, resistance from notifications
   - Bidirectional Control Point (0x2AD9) for ERG mode
-  - Forwards control commands from Zwift to trainer
-  - Routes trainer responses (indications) back to Zwift
+  - Forwards control commands received over serial to the trainer
+  - Prints trainer responses (indications) as `cp_resp` JSON lines
   - Enables structured workouts and resistance control
 
 ### 🔥 Thermal Management & Grade Limiting
@@ -99,9 +98,8 @@ All planned features have been implemented and tested:
 ### Core Application Files
 - **src/main.c** (150 lines)
   - Application entry point and Bluetooth initialization
-  - Peripheral role setup: advertising as HR/CP/FTMS service
+  - Builds the dongle name (`Z-Relay-XXXX` from the identity address) and prints it in an `info` JSON line
   - Connection callbacks: connected(), disconnected()
-  - Starts scan for central role after peripheral advertising begins
 
 - **src/device_manager.c** (280 lines)
   - Central device discovery and connection management
@@ -123,7 +121,7 @@ All planned features have been implemented and tested:
   - HR parsing: extracts BPM from 0x2A37 characteristic
   - CP parsing: power, pedal balance, crank revolutions from 0x2A63
   - FTMS parsing: Indoor Bike Data (0x2AD2) - speed, cadence, power, resistance
-  - Data rebroadcast to peripheral GATT service for Zwift
+  - Prints the parsed values as JSON lines on serial
   - Handles variable-length notifications with flag-based field presence
 
 - **src/gatt_discovery.c** (243 lines)
@@ -135,25 +133,17 @@ All planned features have been implemented and tested:
   - Automatic subscription setup after discovery completes
   - Per-connection discovery state tracking
 
-- **src/gatt_services.c** (69 lines)
-  - Peripheral GATT service definitions (static declarations)
-  - HR Service (0x180D): HR Measurement characteristic with CCC
-  - CP Service (0x1818): CP Measurement characteristic with CCC
-  - FTMS Service (0x1826): Indoor Bike Data, Control Point, Status characteristics
-  - Measurement buffers for data forwarding
-  - Service registration via BT_GATT_SERVICE_DEFINE macros
+- **src/ftms_control_point.c / ftms_control_point.h**
+  - `ftms_cp_handle_command()`: converts 0x11 (simulation) to 0x04 (resistance), applies grade limiting, prints a `sim` JSON line and writes the command to the trainer
+  - Converts the trainer's 0x04 response back to 0x11 and prints it as `cp_resp`
 
-- **src/peripheral_service.c** (180 lines)
-  - Peripheral GATT server implementation
-  - Defines HR/CP/FTMS services and characteristics
-  - Notification enable/disable callbacks (CCC descriptors)
-  - Data forwarding functions: receives from central, notifies to Zwift
-  - FTMS Control Point write handler: forwards commands to trainer
-  - Indication handling: routes trainer responses back to Zwift
-
-- **src/peripheral_service.h** (35 lines)
-  - Public API for peripheral GATT services
-  - Function declarations for service initialization and data forwarding
+- **src/serial_cmd.c / serial_cmd.h**
+  - Line-based JSON commands from z_relay_server over the USB CDC ACM console (RX callback, handed to the system work queue)
+  - `{"cmd":"ftms_cp","data":"<hex>"}`: sends the command to the trainer through `ftms_cp_handle_command()`
+  - `{"cmd":"info"}`: prints `{"type":"info","name":"Z-Relay-XXXX","addr":...,"version":...}`
+  - The trainer's indication is printed as `{"type":"cp_resp","ts":...,"data":"801101"}`
+  - If the command cannot be forwarded (no trainer, write busy, write error) a `cp_resp` with result 0x04 (Operation Failed) is printed immediately
+  - Used by the server's DirCon bridge (`forward_control = true`) so Zwift can control the trainer
 
 ### Persistence Layer
 - **src/nvs_storage.c** (171 lines)
@@ -179,13 +169,13 @@ All planned features have been implemented and tested:
 ### Configuration Files
 - **prj.conf** (20 lines)
   - Zephyr Kconfig options
-  - Bluetooth config: central, peripheral, GATT client/server, max connections
+  - Bluetooth config: central, GATT client, max connections
   - NVS config: FLASH, NVS subsystem
   - Logging config: buffer sizes, processing latency
 
 - **CMakeLists.txt** (8 lines)
   - Build system configuration
-  - Links all source files: main.c, device_manager.c, notification_handler.c, peripheral_service.c, nvs_storage.c
+  - Links all source files: main.c, device_manager.c, gatt_discovery.c, notification_handler.c, ftms_control_point.c, serial_cmd.c, nvs_storage.c, led_feedback.c
 
 - **boards/nrf52840dongle_nrf52840.overlay** (8 lines)
   - Device tree overlay for nRF52840 dongle

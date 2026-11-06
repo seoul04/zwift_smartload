@@ -12,15 +12,17 @@ This project consists of two main components:
 
 ## Architecture
 
+Zwift reaches the sensors through the visualization server's DirCon (Wahoo Direct Connect) bridge:
+
 ```
-Zwift <-> Companion App <-> Fitness Relay (this firmware) <-> Sensors (Polar H10, Favero Assioma, TruTrainer)
+Zwift <-DirCon TCP/mDNS-> Visualization Server <-USB serial-> Fitness Relay <-BLE-> Sensors (Polar H10, Favero Assioma, TruTrainer)
 ```
 
 ## Features
 
 ### Dongle Firmware
 - **Multi-sensor support**: Heart Rate, Cycling Power, and Fitness Machine Service (FTMS)
-- **Dual role operation**: Acts as both BLE central (connects to sensors) and peripheral (advertises to Zwift)
+- **Central only**: Connects to the sensors as BLE central / GATT client and reports their data as JSON lines over USB serial; trainer commands come back the same way
 - **Persistent device storage**: Automatically saves connected devices to NVS with priority reconnection
 - **Thermal management**: Adaptive grade limiting to prevent trainer overheating
 - **Full FTMS support**: Including ERG mode control and bidirectional communication
@@ -30,6 +32,7 @@ Zwift <-> Companion App <-> Fitness Relay (this firmware) <-> Sensors (Polar H10
 - Time window selection (1 min, 5 min, 60 min)
 - Toggle signal visibility
 - Displays: Heart rate, Power meter power/cadence, Trainer speed
+- DirCon server so Zwift (e.g. [netbrain/zwift](https://github.com/netbrain/zwift) in Docker) pairs over the LAN; see [server/README.md](server/README.md#dircon-zwift-without-companion)
 
 ## Hardware Requirements
 

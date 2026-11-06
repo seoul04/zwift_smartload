@@ -17,13 +17,13 @@
 #include <string.h>
 
 #include "common.h"
-#include "gatt_services.h"
-#include "ftms_control_point.h"
 #include "notification_handler.h"
 #include "device_manager.h"
 #include "gatt_discovery.h"
 #include "nvs_storage.h"
 #include "led_feedback.h"
+#include "ecg_stream.h"
+#include "serial_cmd.h"
 
 /* Button configuration */
 #define SW0_NODE DT_ALIAS(sw0)
@@ -39,18 +39,45 @@ K_MUTEX_DEFINE(serial_output_mutex);
 
 /* Global variables */
 struct conn_slot connections[MAX_CONNECTIONS];
-struct bt_conn *peripheral_conn = NULL;
 uint32_t last_cp_data_time = 0;
 uint64_t total_rx_count = 0;
-static char device_name_buffer[32] = DEVICE_NAME_PREFIX;  /* Store current device name for advertising callbacks */
+char device_name_buffer[32] = DEVICE_NAME_PREFIX;
 static uint32_t last_button_event_time = 0;  /* For debouncing */
 #define BUTTON_DEBOUNCE_MS 100
+
+/* Vendor-specific services.
+ * UUID byte arrays are little-endian, i.e. the reverse of the printed form. */
+const struct bt_uuid_128 pmd_service_uuid = BT_UUID_INIT_128(
+	0xc8, 0xf0, 0x8d, 0x2d, 0xcd, 0x8a, 0xad, 0x1c,
+	0x87, 0xf3, 0xe7, 0x02, 0x80, 0x5c, 0x00, 0xfb);
+
+const struct bt_uuid_128 pmd_control_point_uuid = BT_UUID_INIT_128(
+	0xc8, 0xf0, 0x8d, 0x2d, 0xcd, 0x8a, 0xad, 0x1c,
+	0x87, 0xf3, 0xe7, 0x02, 0x81, 0x5c, 0x00, 0xfb);
+
+const struct bt_uuid_128 pmd_data_uuid = BT_UUID_INIT_128(
+	0xc8, 0xf0, 0x8d, 0x2d, 0xcd, 0x8a, 0xad, 0x1c,
+	0x87, 0xf3, 0xe7, 0x02, 0x82, 0x5c, 0x00, 0xfb);
+
+const struct bt_uuid_128 gsp_service_uuid = BT_UUID_INIT_128(
+	0xf0, 0xe8, 0x50, 0x70, 0x0e, 0x63, 0x31, 0xb4,
+	0x5d, 0x4d, 0x85, 0x71, 0x52, 0x22, 0x80, 0x34);
+
+const struct bt_uuid_128 gsp_command_uuid = BT_UUID_INIT_128(
+	0xf0, 0xe8, 0x50, 0x70, 0x0e, 0x63, 0x31, 0xb4,
+	0x5d, 0x4d, 0x85, 0x71, 0x01, 0x00, 0x80, 0x34);
+
+const struct bt_uuid_128 gsp_data_uuid = BT_UUID_INIT_128(
+	0xf0, 0xe8, 0x50, 0x70, 0x0e, 0x63, 0x31, 0xb4,
+	0x5d, 0x4d, 0x85, 0x71, 0x02, 0x00, 0x80, 0x34);
 
 /* Services to discover */
 const struct bt_uuid *discover_services[] = {
 	BT_UUID_HRS,
 	BT_UUID_CPS,
 	BT_UUID_FMS,
+	&gsp_service_uuid.uuid,
+	&pmd_service_uuid.uuid,
 };
 const int discover_service_count = ARRAY_SIZE(discover_services);
 
@@ -89,7 +116,12 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 	}
 
 	log("Connected: %s\n", addr);
-	
+
+	/* MTU exchange runs right after the connection completes, so this is the
+	 * pre-exchange value. The settled MTU is logged on the first notification. */
+	slot->mtu_logged = false;
+	log("Initial ATT MTU: %u\n", bt_gatt_get_mtu(conn));
+
 	/* Update LED feedback for new connection */
 	led_feedback_update();
 	
@@ -111,8 +143,8 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 	/* Save device to NVS for future reconnection priority */
 	save_connected_device(conn);
 
-	/* Start discovery */
-	start_discovery(conn, slot_idx);
+	/* Log every service first, then run the targeted per-service discovery. */
+	start_enumeration(conn, slot_idx);
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
@@ -148,6 +180,11 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 			
 			/* Clear subscription state so params can be reused */
 			connections[i].subscribe_count = 0;
+			connections[i].cur_service = 0;
+			/* Drop the ECG sample clock and any half-received GSP frame:
+			 * a reconnect starts a new stream at a new time base. */
+			ecg_stream_reset(&connections[i]);
+			connections[i].hr_rr_misses = 0;
 			
 			bt_conn_unref(connections[i].conn);
 			connections[i].conn = NULL;
@@ -164,19 +201,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	cancel_connection_timeout(conn);
 
 	if (found_slot) {
-		/* Sensor disconnected */
 		start_scan();
-	} else {
-		/* Peripheral disconnected */
-		log("Peripheral disconnected, restarting advertising\n");
-		
-		if (peripheral_conn == conn) {
-			bt_conn_unref(peripheral_conn);
-			peripheral_conn = NULL;
-			log("[FTMS CP] Cleared peripheral connection\n");
-		}
-		
-		start_advertising(device_name_buffer);
 	}
 }
 
@@ -245,6 +270,20 @@ static void button_pressed(const struct device *dev, struct gpio_callback *cb, u
 	}
 }
 
+void announce_identity(void)
+{
+	bt_addr_le_t id_addrs[CONFIG_BT_ID_MAX];
+	size_t id_count = ARRAY_SIZE(id_addrs);
+	char id_addr[BT_ADDR_STR_LEN] = "";
+
+	bt_id_get(id_addrs, &id_count);
+	if (id_count > 0) {
+		bt_addr_to_str(&id_addrs[0].a, id_addr, sizeof(id_addr));
+	}
+	json_out("{\"type\":\"info\",\"ts\":%u,\"name\":\"%s\",\"addr\":\"%s\",\"version\":\"%s\"}\n",
+		 k_uptime_get_32(), device_name_buffer, id_addr, VERSION);
+}
+
 int main(void)
 {
 	int err;
@@ -286,8 +325,18 @@ int main(void)
 
 	/* Initialize modules */
 	device_manager_init();
-	ftms_control_point_init();
 	led_feedback_init();
+
+	/* Commands from z_relay_server over the console, so Zwift's FTMS control
+	 * point writes (grade, ERG) reach the trainer. Without this the server's
+	 * write blocks against a CDC endpoint nobody drains and wedges its DirCon
+	 * event loop. */
+	int serial_err = serial_cmd_init();
+
+	if (serial_err) {
+		log("Serial command input unavailable (err %d); control point "
+		    "writes from the server will not reach the trainer\n", serial_err);
+	}
 
 	/* Print initial device list */
 	print_device_list();
@@ -305,10 +354,14 @@ int main(void)
 		device_name_buffer[sizeof(device_name_buffer) - 1] = '\0';
 	}
 	
-	bt_set_name(device_name_buffer);
 	log("Bluetooth initialized as '%s'\n", device_name_buffer);
 
-	start_advertising(device_name_buffer);
+	/* Announce our identity on the console. z_relay_server uses the name and
+	 * address to present the sensors to Zwift over DirCon. (This is the line
+	 * the server reads; the console also carries commands the other way, see
+	 * serial_cmd_init().) */
+	announce_identity();
+
 	log("Device ready - press button for 2+ seconds to enable scanning (5 min window)\n");
 	return 0;
 }

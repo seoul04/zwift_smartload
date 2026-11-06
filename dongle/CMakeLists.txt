@@ -7,13 +7,14 @@ project(central_hr)
 # Modular version
 target_sources(app PRIVATE
     src/main.c
-    src/gatt_services.c
     src/ftms_control_point.c
     src/notification_handler.c
     src/device_manager.c
     src/gatt_discovery.c
     src/nvs_storage.c
     src/led_feedback.c
+    src/ecg_stream.c
+    src/serial_cmd.c
 )
 
 zephyr_library_include_directories(${ZEPHYR_BASE}/samples/bluetooth)

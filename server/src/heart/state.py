@@ -67,10 +67,14 @@ class HeartState:
 
         self._ecg = EcgRing(fs_hz=fs_hz, seconds=ECG_RING_SECONDS)
         self._hr = HrFilter()
+        self._overlay = BeatOverlay(BeatTemplate())
+        # Beats are detected from the waveform when the rate allows it; below
+        # 200 Hz the Pan–Tompkins port does not apply and the sensor's own
+        # announcements drive the stack instead.
+        self._overlay.use_qrs(fs_hz)
         self._nnh = NnHrv()
         self._trends = TrendTrace()
         self._grid = RmssdGrid(RmssdMapConfig())
-        self._overlay = BeatOverlay(BeatTemplate())
 
         # Time at the right edge of the plots: the newest ECG sample, or the
         # dongle's own timestamp when there is no ECG.
@@ -129,6 +133,9 @@ class HeartState:
             if fs_hz != self._ecg.fs_hz:
                 self._ecg = EcgRing(fs_hz=fs_hz, seconds=ECG_RING_SECONDS)
                 self.fs_hz = fs_hz
+                # The beat detector is rate-specific, and the session may have
+                # started on the 130 Hz fallback before the dongle said 256 Hz.
+                self._overlay.use_qrs(fs_hz)
             # A dongle reboot restarts its uptime clock; the beats and trends
             # are anchored on it, so the whole session starts over rather than
             # mixing two clocks in one plot. Both the ring and the session
@@ -278,6 +285,11 @@ class HeartState:
                 "ecg_samples": self._ecg.count(),
                 "beats": self._rr_beats,
                 "buffered_beats": self._overlay.buffered_count(),
+                # Whether the beats stack is drawing from detected R peaks
+                # (200 Hz and up) or from the sensor's announcements.
+                "detecting": self._overlay.detecting,
+                "beat_lag_ms": self._overlay.lag_ms(),
+                "detector_fed": self._overlay.detector_fed(),
                 "last_rr_ms": self._last_rr_ms,
                 "now_ms": self._now(),
                 "hr_bpm": round(self._hr.bpm(), 1),
@@ -411,6 +423,10 @@ class HeartState:
                 "presets_min": list(TREND_WIDTH_MINUTES),
                 "hr_axis": frame.hr_axis.to_dict(),
                 "rmssd_axis": frame.rmssd_axis.to_dict(),
+                # The tile grid's legend, so a filled RMSSD curve on this panel
+                # means the same colour as a tile over there. One definition of
+                # "green/yellow/red" for both graphs, from `RmssdMapConfig`.
+                "color_stops": [[ms, color] for ms, color in self._grid.cfg.color_stops],
             }
 
     def rmssd_frame(self) -> Dict[str, Any]:

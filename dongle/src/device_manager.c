@@ -13,6 +13,7 @@
 #include "device_manager.h"
 #include "nvs_storage.h"
 #include "led_feedback.h"
+#include "ecg_stream.h"
 
 sys_slist_t device_list;
 
@@ -76,12 +77,24 @@ static void conn_timeout_handler(struct k_work *work)
 		char addr[BT_ADDR_LE_STR_LEN];
 		bt_addr_le_to_str(bt_conn_get_dst(pending_conn), addr, sizeof(addr));
 		log("Connection timeout to %s, cancelling...\n", addr);
-		
+
+		/* Drop the reference before asking for a disconnect, and clear
+		 * pending_conn either way.
+		 *
+		 * This used to clear both only when bt_conn_disconnect() failed. On
+		 * success pending_conn kept pointing at a connection that was being
+		 * torn down, so it was never unref'd and stayed stale; and because the
+		 * work was scheduled with k_work_schedule() it could fire again on a
+		 * still-live connection, disconnecting devices that had connected
+		 * perfectly well. On hardware that showed up as a disconnect/reconnect
+		 * cycle every few seconds with reason 0x00 (local termination). */
 		int err = bt_conn_disconnect(pending_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+
+		bt_conn_unref(pending_conn);
+		pending_conn = NULL;
+
 		if (err) {
 			log("Failed to cancel connection (err %d)\n", err);
-			bt_conn_unref(pending_conn);
-			pending_conn = NULL;
 			start_scan();
 		}
 	}
@@ -325,7 +338,20 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			}
 
 			if (free_slot >= 0) {
-				struct bt_le_conn_param *param = BT_LE_CONN_PARAM_DEFAULT;
+				/* BT_LE_CONN_PARAM_DEFAULT uses a 30 ms interval and a
+				 * short supervision timeout. On a marginal link (-80 dBm
+				 * measured) that expires during momentary fades and tears
+				 * the connection down with HCI reason 0x08, which also
+				 * aborts the ECG stream mid-batch. Ask for the longest
+				 * supervision timeout the spec allows (32 s) so short
+				 * fades are ridden out instead of ending the session; the
+				 * sensor may counter-propose, which the stack handles. */
+				static struct bt_le_conn_param param = {
+					.interval_min = 24,   /* 30 ms */
+					.interval_max = 40,   /* 50 ms */
+					.latency = 0,
+					.timeout = 400,       /* 4 s supervision */
+				};
 				int err;
 
 				/* Clear the slot to ensure clean state for new connection */
@@ -342,6 +368,15 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 				connections[free_slot].movesense_cmd_handle = 0;
 				connections[free_slot].temp_value_handle = 0;
 
+				/* Reset the GSP subscribe state for the new connection.
+				 * ecg_stream_reset() clears the current references and the
+				 * step counter while preserving the previous ones, so the
+				 * subscribe sequence can unsubscribe them first. It is safe
+				 * to keep them even if a different device takes this slot:
+				 * gsp_send_next() only runs for peers that expose the GSP
+				 * command characteristic. */
+				ecg_stream_reset(&connections[free_slot]);
+
 				err = bt_le_scan_stop();
 				if (err) {
 					log("Stop LE scan failed (err %d)\n", err);
@@ -350,7 +385,7 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 					struct bt_conn_le_create_param create_param = *BT_CONN_LE_CREATE_CONN;
 					create_param.options = 0;
 					
-					err = bt_conn_le_create(&dev_info->addr, &create_param, param, &connections[free_slot].conn);
+					err = bt_conn_le_create(&dev_info->addr, &create_param, &param, &connections[free_slot].conn);
 					if (err) {
 						log("Create connection failed (err %d)\n", err);
 						connections[free_slot].conn = NULL;

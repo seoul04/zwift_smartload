@@ -31,11 +31,12 @@ The minimal, min+LED, min+PRINTK_SYNC and min+BT builds all keep
 | ours, `led_feedback_init()` removed | ~145 s |
 | ours, `board_early_init_hook` emptied (stays 1.8 V) | ~149 s |
 | ours, both of the above | ~319 s idle, then fails on port open |
+| ours, boot NVS read removed | ~386 s idle, then fails on port open |
+| ours, `serial_cmd_init()` disabled | fails on port open |
 
-The latency moved with the two power-related changes but the failure never went
-away, and `min+LED` (which runs the same LED code) is stable. **The 25/145/319 s
-numbers are therefore timing, not cause.** Do not treat the power changes as a
-fix.
+The latency moved with several unrelated changes but the failure never went
+away, and every isolated minimal build is stable. **The 25/145/319/386 s numbers
+are therefore timing, not cause.** Do not treat any of these as a fix.
 
 ## Ruled out, each by a build that still failed
 
@@ -48,6 +49,12 @@ fix.
 - **`CONFIG_PRINTK_SYNC=y`** — isolated in `min+PRINTK_SYNC`, stable.
 - **`CDC_ACM_SERIAL_INITIALIZE_AT_BOOT=y`** — every stable build has it `=y`,
   so it is not the trigger either.
+- **`nvs_storage` boot read** — shipping app with `nvs_get_device_suffix()`
+  removed survived 386 s idle with 0 errors, then still failed on port open.
+  Latency only, same as the power changes.
+- **`serial_cmd_init()` RX path** — none of the stable builds call it, so it was
+  a candidate for the port-open crash specifically. Shipping app with it
+  disabled still fails on port open.
 - **Crystal vs RC clock** — both fail; `hci_usb` runs BLE on XTAL fine.
 - **TLP/USB autosuspend** — the working `cdc_acm` sample is also
   `control=auto` / `status=suspended` and never misses a beat.

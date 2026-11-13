@@ -73,7 +73,9 @@ const struct bt_uuid_128 gsp_data_uuid = BT_UUID_INIT_128(
 
 /* Services to discover */
 const struct bt_uuid *discover_services[] = {
+#ifndef HR_OFF
 	BT_UUID_HRS,
+#endif
 	BT_UUID_CPS,
 	BT_UUID_FMS,
 	&gsp_service_uuid.uuid,
@@ -325,6 +327,7 @@ int main(void)
 
 	/* Initialize modules */
 	device_manager_init();
+	ecg_stream_init();
 	led_feedback_init();
 
 	/* Commands from z_relay_server over the console, so Zwift's FTMS control

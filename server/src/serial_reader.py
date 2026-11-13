@@ -267,6 +267,12 @@ class SerialReader:
                 })
 
         elif msg_type == 'cp':
+            # Liveness, whether or not the packet carries an RSSI (a replayed
+            # session never does). Without this the only paths that mark the
+            # power meter as seen are `device_rssi`/`device_battery`, so a
+            # recording streamed power and cadence while the header LED stayed
+            # grey: the data was live and the device read as absent.
+            self.data_queue.put({'event': 'device_seen', 'device': 'cp', 'timestamp_ms': ts})
             if data.get('power') is not None:
                 self.data_queue.put({'timestamp_ms': ts, 'metric': 'power_meter_power', 'value': float(data['power'])})
             if data.get('cadence') is not None:
@@ -289,6 +295,8 @@ class SerialReader:
                 })
         
         elif msg_type == 'ftms':
+            # Liveness for the trainer, for the same reason as `cp` above.
+            self.data_queue.put({'event': 'device_seen', 'device': 'ftms', 'timestamp_ms': ts})
             if data.get('speed') is not None:
                 self.data_queue.put({'timestamp_ms': ts, 'metric': 'trainer_speed', 'value': float(data['speed'])})
             if data.get('power') is not None:

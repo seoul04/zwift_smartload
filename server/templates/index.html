@@ -173,6 +173,11 @@
             background: #4CAF50;
         }
         
+        /* Port is open but no data is arriving: connected, yet not usable. */
+        .status-indicator.stale {
+            background: #FF9800;
+        }
+        
         .device-status {
             display: flex;
             gap: 20px;
@@ -520,8 +525,11 @@
                     </div>
                 </div>
                 <div class="legend">
-                    <span class="legend-item"><span class="legend-dot" style="background:#4CAF50"></span>HR</span>
-                    <span class="legend-item"><span class="legend-dot" style="background:#FF9800"></span>RMSSD30</span>
+                    <span class="legend-item"><span class="legend-dot" style="background:#e8e8e8"></span>HR</span>
+                    <!-- RMSSD30 is a value-filled area, so its swatch is the
+                         scale rather than one colour: low (green) to high (red),
+                         the same stops the RMSSD tiles use. -->
+                    <span class="legend-item"><span class="legend-dot" id="trends-r30-swatch"></span>RMSSD30</span>
                     <span class="legend-item"><span class="legend-dot" style="background:#64B5F6"></span>RMSSD300</span>
                 </div>
                 <div class="graph-canvas-wrap">

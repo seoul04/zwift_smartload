@@ -1,0 +1,40 @@
+# Static partition layout for the PCA10059 dongle.
+#
+# Why this file exists
+# --------------------
+# NCS auto-generates an `nvs_storage` partition (pm.yml.nvs) with
+# `placement: before: [tfm_storage, end]`, which puts it at the very END of
+# flash: 0xfa000..0x100000.
+#
+# On this board that region belongs to the Open DFU bootloader. The board DTS
+# declares storage_partition at 0xdc000..0xe0000 and effectively reserves
+# 0xe0000..0x100000 for the bootloader. Erasing a page in the bootloader's
+# region does not complete - the NVMC ready flag never sets - so nvs_mount()
+# hangs forever on its first write. That is the whole startup hang.
+#
+# Fix: pin nvs_storage to the address the DTS already uses, and declare the
+# bootloader region so Partition Manager has exactly one dynamic gap (for
+# `app`) to fill.
+app:
+  address: 0x1000
+  end_address: 0xdc000
+  region: flash_primary
+  size: 0xdb000
+bootloader:
+  address: 0xe0000
+  end_address: 0x100000
+  region: flash_primary
+  size: 0x20000
+nrf5_mbr:
+  address: 0x0
+  end_address: 0x1000
+  placement:
+    after:
+    - start
+  region: flash_primary
+  size: 0x1000
+nvs_storage:
+  address: 0xdc000
+  end_address: 0xe0000
+  region: flash_primary
+  size: 0x4000

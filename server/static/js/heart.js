@@ -28,7 +28,10 @@
         // The stack ramps oldest (faint) to newest (solid); see beatStroke().
         beat: '#4CAF50',
         beatOldAlpha: 0.12,
-        hr: '#4CAF50',
+        // HR is deliberately off-scale: a near-white trace reads as neutral
+        // and cannot be mistaken for a point on the RMSSD green-red ramp
+        // underneath it.
+        hr: '#e8e8e8',
         r30: '#FF9800',
         r300: '#64B5F6',
         tileEmpty: 'rgba(224, 224, 224, 0.08)',
@@ -299,6 +302,19 @@
             }
         }
         return last[1];
+    }
+
+    /**
+     * Paint the trends legend's RMSSD30 swatch as the value scale itself.
+     *
+     * Built from the same `color_stops` the fill and the RMSSD tiles use, so
+     * the three cannot drift apart. Guarded: the element is optional.
+     */
+    function paintTrendsSwatch(stops) {
+        const node = el('trends-r30-swatch');
+        if (!node || !stops || stops.length === 0) return;
+        const parts = stops.map(([, color]) => color);
+        node.style.background = `linear-gradient(90deg, ${parts.join(', ')})`;
     }
 
     // ------------------------------------------------------------------
@@ -656,6 +672,12 @@
         const hrAxis = frame.hr_axis;
         const msAxis = frame.rmssd_axis;
 
+        // The legend swatch is painted from the same stops as the fill, so a
+        // change to the tile legend can never leave this one stale. Done before
+        // the "no beats yet" exit so the swatch is correct while the graph is
+        // still empty.
+        paintTrendsSwatch(frame.color_stops);
+
         // Horizontal grid on the RMSSD axis; the HR axis is labelled but not
         // gridded, so the panel does not become a mesh of two ladders.
         ctx.strokeStyle = C.grid;
@@ -704,34 +726,159 @@
         const start = frame.now_ms - windowMs;
         const xAt = (i) => left + ((frame.times_ms[i] - start) / windowMs) * plotW;
 
-        drawSeries(ctx, frame.hr_bpm, frame.count, hrAxis, top, bottom, plotH, C.hr, xAt);
-        drawSeries(ctx, frame.rmssd30_ms, frame.count, msAxis, top, bottom, plotH, C.r30, xAt);
+        // RMSSD30 is a filled area rather than a bare line: the fill is keyed
+        // to the tile panel's colour stops, so this curve carries the same
+        // green/yellow/red reading as an RMSSD tile at the same value. It goes
+        // down first, otherwise the opaque area would bury the two lines that
+        // share the panel.
+        drawFilledSeries(ctx, frame.rmssd30_ms, frame.count, msAxis, top, bottom, plotH,
+                         frame.color_stops, C.r30, xAt, left, right);
+        // The halo is the panel background, so the pale HR trace keeps a dark
+        // edge wherever it runs over a bright part of the RMSSD fill.
+        drawSeries(ctx, frame.hr_bpm, frame.count, hrAxis, top, bottom, plotH, C.hr, xAt,
+                   'rgba(42, 42, 42, 0.85)');
         drawSeries(ctx, frame.rmssd300_ms, frame.count, msAxis, top, bottom, plotH, C.r300, xAt);
     }
 
-    /** One curve; null breaks the line, so warm-up gaps stay visible as gaps. */
-    function drawSeries(ctx, values, count, axis, top, bottom, plotH, color, xAt) {
+    /**
+     * One curve drawn as a value-coloured area.
+     *
+     * A canvas gradient can only interpolate along one direction, and here the
+     * colour has to follow the *value* (y), not the position (x) — a session
+     * that starts calm and ends stressed has both colours on the same plot. So
+     * the area is filled with a vertical gradient built from the colour stops,
+     * which is exactly a value ramp because y is linear in the value. Above and
+     * below the last stops the gradient clamps to that stop's colour, the same
+     * way `rmssdColor` clamps a value.
+     */
+    function drawFilledSeries(ctx, values, count, axis, top, bottom, plotH, stops, lineColor, xAt, left, right) {
         const span = axisSpan(axis);
         if (span <= 0) return;
-        let open = false;
-        ctx.beginPath();
+
+        // Break the curve into runs of finite samples: a warm-up gap must not
+        // be bridged with a flat segment, which would draw a value that was
+        // never measured.
+        const runs = [];
+        let run = null;
         for (let i = 0; i < count; i++) {
             const v = values[i];
             if (v === null || v === undefined || !isFinite(v)) {
-                open = false;
+                run = null;
                 continue;
             }
             const x = xAt(i);
             const y = bottom - ((v - axis.min) / span) * plotH;
-            if (open) ctx.lineTo(x, y);
-            else ctx.moveTo(x, y);
-            open = true;
+            if (!run) {
+                run = [];
+                runs.push(run);
+            }
+            run.push([x, y]);
         }
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1.6;
-        ctx.lineJoin = 'round';
-        ctx.lineCap = 'round';
-        ctx.stroke();
+        if (runs.length === 0) return;
+
+        const grad = ctx.createLinearGradient(0, top, 0, bottom);
+        // Offset 0 is the top of the plot (axis max), 1 is the bottom (axis min),
+        // which is the same direction the gradient runs.
+        const offsetFor = (value) =>
+            Math.min(Math.max(1 - (value - axis.min) / span, 0), 1);
+        const ramp = stops && stops.length ? stops : [];
+        if (ramp.length === 0) {
+            grad.addColorStop(0, withAlpha(lineColor, 0.35));
+            grad.addColorStop(1, withAlpha(lineColor, 0.10));
+        } else {
+            // Clamp the ends to the axis edges so the ramp covers the whole
+            // plot height instead of only the span between the first and last
+            // stop (which would compress every colour into the middle).
+            grad.addColorStop(0, ramp[ramp.length - 1][1]);
+            for (const [value, color] of ramp) {
+                grad.addColorStop(offsetFor(value), color);
+            }
+            grad.addColorStop(1, ramp[0][1]);
+        }
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(left, top, right - left, plotH);
+        ctx.clip();
+
+        for (const points of runs) {
+            if (points.length === 1) {
+                ctx.fillStyle = grad;
+                ctx.fillRect(points[0][0] - 1, points[0][1], 2, bottom - points[0][1]);
+                continue;
+            }
+            ctx.beginPath();
+            ctx.moveTo(points[0][0], bottom);
+            for (const [x, y] of points) ctx.lineTo(x, y);
+            ctx.lineTo(points[points.length - 1][0], bottom);
+            ctx.closePath();
+            ctx.globalAlpha = 0.55;
+            ctx.fillStyle = grad;
+            ctx.fill();
+        }
+
+        // A thin top edge in the same ramp keeps the curve legible where the
+        // fill is pale, without introducing a second colour legend.
+        ctx.globalAlpha = 1;
+        for (const points of runs) {
+            if (points.length < 2) continue;
+            ctx.beginPath();
+            ctx.moveTo(points[0][0], points[0][1]);
+            for (const [x, y] of points) ctx.lineTo(x, y);
+            ctx.lineWidth = 1.4;
+            ctx.lineJoin = 'round';
+            ctx.lineCap = 'round';
+            ctx.strokeStyle = grad;
+            ctx.stroke();
+        }
+        ctx.restore();
+    }
+
+    /**
+     * One curve; null breaks the line, so warm-up gaps stay visible as gaps.
+     *
+     * `halo` (optional) is a wider stroke laid down underneath in that colour,
+     * so a pale line still reads where it crosses the saturated RMSSD fill.
+     */
+    function drawSeries(ctx, values, count, axis, top, bottom, plotH, color, xAt, halo) {
+        const span = axisSpan(axis);
+        if (span <= 0) return;
+
+        // One path per unbroken run: a gap has to end the subpath, because a
+        // single path would bridge it with a straight line the data never had.
+        const runs = [];
+        let run = null;
+        for (let i = 0; i < count; i++) {
+            const v = values[i];
+            if (v === null || v === undefined || !isFinite(v)) {
+                run = null;
+                continue;
+            }
+            if (!run) {
+                run = [];
+                runs.push(run);
+            }
+            run.push([xAt(i), bottom - ((v - axis.min) / span) * plotH]);
+        }
+        if (runs.length === 0) return;
+
+        const stroke = (width, style) => {
+            ctx.strokeStyle = style;
+            ctx.lineWidth = width;
+            ctx.lineJoin = 'round';
+            ctx.lineCap = 'round';
+            for (const points of runs) {
+                ctx.beginPath();
+                ctx.moveTo(points[0][0], points[0][1]);
+                for (let k = 1; k < points.length; k++) {
+                    ctx.lineTo(points[k][0], points[k][1]);
+                }
+                ctx.stroke();
+            }
+        };
+
+        if (halo) stroke(4, halo);
+        stroke(1.6, color);
     }
 
     function axisSpan(axis) {

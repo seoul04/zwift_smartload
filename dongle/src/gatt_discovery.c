@@ -600,6 +600,7 @@ void start_discovery(struct bt_conn *conn, int slot_idx)
 	slot->gsp_ecg_started = 0;
 	slot->hr_rr_misses = 0;
 	slot->ecg_clock_valid = 0;
+	slot->ecg_acc = 0;
 
 	slot->discover_uuid = discover_services[0];
 	slot->discover_params.uuid = slot->discover_uuid;

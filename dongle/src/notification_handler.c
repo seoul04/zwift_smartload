@@ -113,6 +113,8 @@ static void handle_gsp_data(struct conn_slot *slot, const uint8_t *d, uint16_t l
 		return;
 	}
 
+	slot->gsp_notifs++;
+
 	uint8_t type = d[0];
 	uint8_t ref = d[1];
 
@@ -143,9 +145,38 @@ static void handle_gsp_data(struct conn_slot *slot, const uint8_t *d, uint16_t l
 			uint16_t status = sys_get_be16(&d[2]);
 
 			if (status != GSP_HTTP_OK) {
-				log("[GSP] Command ref %u failed with HTTP %u\n", ref, status);
+				log("[GSP] Command 0x%02x ref %u failed with HTTP %u%s\n",
+				    slot ? slot->gsp_last_cmd : 0, ref, status,
+				    status == GSP_HTTP_CONFLICT ? " (CONFLICT)" : "");
+
+				/* 409 Conflict on a SUBSCRIBE means the sensor still has
+				 * the measurement running from a previous subscription.
+				 * That is recoverable, not fatal: the stream keeps
+				 * arriving and gsp_parse_frame() adopts its reference off
+				 * the wire. Clearing our reference lets that adoption
+				 * happen, whereas keeping the rejected one would make
+				 * every incoming frame an "unknown ref". */
+				if (status == GSP_HTTP_CONFLICT && slot &&
+				    ref == slot->gsp_ref_ecg) {
+					log("[GSP] ECG already streaming under another "
+					    "ref; adopting it from the wire, then "
+					    "releasing and resubscribing\n");
+					slot->gsp_ref_ecg = 0;
+
+					/* Schedule the real repair: learn the live
+					 * reference from the frames, UNSUBSCRIBE it,
+					 * then subscribe afresh. */
+					gsp_note_conflict(slot);
+				}
 			} else {
-				log("[GSP] Command ref %u accepted\n", ref);
+				log("[GSP] Command 0x%02x ref %u accepted\n",
+				    slot ? slot->gsp_last_cmd : 0, ref);
+				if (slot && slot->gsp_last_cmd == GSP_CMD_UNSUBSCRIBE) {
+					/* Recorded so a release that the sensor never
+					 * acknowledged can be told apart from one that
+					 * succeeded. */
+					slot->gsp_unsub_status = GSP_HTTP_OK;
+				}
 			}
 		}
 		return;
@@ -155,6 +186,7 @@ static void handle_gsp_data(struct conn_slot *slot, const uint8_t *d, uint16_t l
 		/* A new frame starts. If one is already buffered it never received a
 		 * continuation, so parse what we have before replacing it. */
 		if (slot->gsp_pending && slot->gsp_len > 0) {
+			slot->gsp_frames_done++;
 			gsp_parse_frame(slot, slot->gsp_ref, slot->gsp_buf, slot->gsp_len);
 		}
 		slot->gsp_pending = false;
@@ -247,6 +279,11 @@ uint8_t notify_func(struct bt_conn *conn,
 	}
 
 	log_mtu_once(slot, conn);
+
+	slot->all_notifs++;
+	if (kind == SUB_HR_MEASUREMENT) {
+		slot->hr_notifs++;
+	}
 
 	if (kind == SUB_POLAR_PMD_CONTROL) {
 		ecg_handle_pmd_control_point(data, length);

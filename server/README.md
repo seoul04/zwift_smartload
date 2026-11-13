@@ -43,6 +43,8 @@ cd docker && docker compose up -d --build
 - Time window selection (1 min, 5 min, 60 min)
 - Toggle signal visibility
 - Displays: Heart rate, Power meter power/cadence, Trainer speed
+- EDF+ session recording — every session can be written to a file EDFbrowser
+  reads, and replayed through the server (see [EDF recording](#edf-recording))
 - DirCon server: Zwift pairs with the relay over Wi-Fi/Ethernet instead of Bluetooth
 - Heart tabs, ported from the `my_heart` Android app and drawn on canvas:
   - **ECG** — the raw single-lead strip, scrolled by a playback clock the way the
@@ -119,11 +121,146 @@ python playback_serial.py sample.json --output /tmp/ttyV0
 python run.py
 ```
 
+Or replay an EDF session, which is what exercises the heart panels — a JSON log
+carries no `ecg` line and no `rr` array, so it leaves ECG, Beats, Trends and
+RMSSD empty:
+```bash
+python playback_edf.py recordings/zrelay_20261107_182456.edf --output /tmp/ttyV0
+python run.py
+```
+
 Unit tests:
 ```bash
 pip install -r requirements-dev.txt
 pytest
 ```
+
+## EDF recording
+
+With `[edf] enabled = true`, every session is written to an EDF+C file. EDF was
+chosen because it is the format **EDFbrowser** reads, so a recording is both
+analysable by hand and replayable through this server.
+
+```
+sensors --BLE--> dongle --USB JSON--> server --EDF+--> recordings/
+                                         `--playback_edf.py--> pty --> server
+```
+
+Channels in every file:
+
+| Channel | Rate | Unit | Contents |
+|---|---|---|---|
+| `ECG` | `fs` (256 Hz) | µV | the raw single lead, as the dongle streams it |
+| `RR_MS` | 5 Hz | ms | sensor R–R, sampled 5× a second (see below) |
+| `SENSOR_HR` | 1 Hz | bpm | the bpm the strap itself reported |
+| `HR_EMA`, `MEAN_RR`, `HRV_RMSSD30`, `HRV_RMSSD300` | 1 Hz | bpm / ms | derived from `RR_MS`, see below |
+| `POWER`, `CADENCE` | 1 Hz | W / rpm | power meter |
+| `TRAINER_POWER`, `TRAINER_CADENCE`, `SPEED` | 1 Hz | W / rpm / m/h | trainer (FTMS) |
+| `RESISTANCE` | 1 Hz | % | the setpoint the dongle derived from the commanded grade |
+| `TRAINER_RES` | 1 Hz | % | the resistance the trainer says it is applying |
+| `GRADE` | 1 Hz | % | the grade Zwift commanded (what the dongle forwards) |
+| `CMD_GRADE`, `CMD_RESISTANCE` | 1 Hz | % | the control point write as the server saw it |
+| `EDF Annotations` | — | — | `GAP` markers where delivery stalled |
+
+`SENSOR_HR` is stored next to the derived rate rather than instead of it
+because the two are not always the same number: on a live session the strap's
+bpm matched `60000/RR` exactly only 42 % of the time, with a tail up to 15 bpm
+apart. Keeping both means a strap disagreeing with its own intervals shows up
+in the file instead of being silently smoothed over. `GRADE` and `RESISTANCE`
+are the same pair for the trainer: the dongle converts a commanded grade into a
+resistance setpoint (`RESISTANCE`), while the trainer separately reports the
+resistance it is actually applying (`TRAINER_RES`) — which lags by seconds and
+is the only evidence that it followed.
+
+The four heart metrics are **computed, not received**. The dongle sends
+intervals, not heart rate: `HR_EMA` is the smoothed rate from `HrFilter` (locks
+after three consistent intervals, follows small changes, and re-acquires rather
+than chasing one ectopic beat), `MEAN_RR` is the mean of the last 30 intervals,
+and the two RMSSDs cover the last 30 and 300 intervals. They are the same
+filters, fed in the same order, as `src/heart` — so the file reports the values
+the page was showing, and a disagreement would mean a bug in one of the two.
+A zero means *not known yet* (the EMA has not locked, or the RMSSD window is
+short of its minimum), exactly as the dashboard leaves the tile blank.
+
+`RR_MS` is a *step* channel: it holds the latest interval, so a change in the
+held value is what marks a beat. That makes its rate a fidelity decision, not
+just a size one — two beats inside one sample period are indistinguishable from
+one, and the earlier interval is simply gone.
+
+It used to run at the full ECG rate (one `int16` per sample, 512 B/s at 256 Hz
+for ~1.5 B/s of information), then briefly at 1 Hz. 1 Hz was a mistake: it needs
+two beats within 1000 ms, i.e. anything above 60 bpm, and because replaying a
+file reads its beats back out of this channel, the loss became **wrong RMSSD**
+rather than a cosmetic gap. A 582-beat ride recovered only 366 intervals — 37 %
+missing.
+
+It is now 5 Hz. The shortest gap that can be hidden is 200 ms (300 bpm), and the
+same 582-beat ride round-trips with all 582 intervals and an identical RMSSD
+(18.00 ms, zero difference). The cost is 8 B/s more than 1 Hz and still 56 %
+less than the full-rate layout. It also matches what the Android app writes, so
+files from either producer read alike.
+
+A step channel has one limit that **no sample rate can fix**: consecutive beats
+with an *identical* interval produce no change in the held value, so the second
+beat is invisible. A real capture had 26 such pairs and recovered 158 of 167
+beats at 1, 5, 10 and 50 Hz alike. So every beat is also written as a `BEAT`
+annotation (onset only — the interval stays in `RR_MS`, so the two cannot
+disagree). Round-tripping that capture writes 167 annotations against 141
+step-channel marks: the 26 that the channel can never represent.
+
+In short, `RR_MS` is the plottable staircase and `BEAT` annotations are the
+complete beat log. Neither substitutes for the other, and dropping the
+annotations silently truncates the rhythm.
+
+`GRADE` and `CMD_GRADE` both come off the wire in hundredths of a percent (the
+FTMS simulation field is an `int16` in 0.01 %), and both are divided by 100 on
+the way in, so a 3 % climb reads 3 in the file. `RESISTANCE` needs no such
+treatment: the dongle has already converted the grade to a unitless 0–100 target
+before it logs it.
+
+The command channels are kept apart from the reported ones because the
+difference between them is usually the question being asked — a trainer that
+acknowledges a grade and then holds a different resistance shows up as the two
+series diverging, which a single fused "resistance" line would hide.
+
+### Sessions
+
+The dongle timestamps with its uptime clock, so a reboot (a USB reset is
+enough) restarts `ts` near zero. That is treated as the end of a session and the
+start of the next file: splicing two clocks into one EDF would put a jump in the
+timeline. Late points *within* a session are not affected — only a rewind larger
+than 5 s.
+
+Files are named `zrelay_<yyyyMMdd_HHmmss>.edf`, so a directory listing sorts
+chronologically. `max_files` keeps the newest and deletes the oldest; only files
+matching the prefix and the timestamp pattern are ever removed, so a hand-copied
+recording in the same folder is safe.
+
+Stop the server with SIGTERM or Ctrl-C, not SIGKILL: records are coalesced for
+about a minute, and the shutdown handler is what flushes and patches the record
+count. A SIGKILL leaves a file whose header still says `n_rec = -1`; it reads
+correctly (the count is recovered from the file length) but drops the last
+unsaved minute. `POST /api/edf/close` finishes a session and starts a new one
+without stopping the server, and `GET /api/edf/status` reports the current file.
+
+### Replaying a session
+
+```bash
+python playback_edf.py session.edf --inspect          # what is in the file
+python playback_edf.py session.edf --output /tmp/ttyV0
+python playback_edf.py session.edf --loop --speed 2   # 2x, continuous
+```
+
+The replayer opens a pty and writes the same JSON lines the firmware emits,
+paced on the recording's own clock (measured drift is under 1 ms per event at 1×
+and 2×). ECG goes out in ~1 s bursts of 16-sample lines a fraction of a
+millisecond apart, like the dongle, because the scrolling strip learns that
+cadence to size its playback lead — a uniformly-paced stream would replay
+correctly but would not exercise the burst handling.
+
+What is not replayed: the `CMD_` *input* channels. Those record what Zwift asked
+for, which is not sensor data; live control-point writes during the run
+regenerate them.
 
 ### How the ECG strip scrolls
 
@@ -154,6 +291,68 @@ the window follows it. It is the same design as the app's `EcgTrace`:
 The browser fetches a frame per animation frame (~60 fps) while the ECG tab is
 visible, so this is the one panel that does not use the shared 250 ms interval.
 Samples are sent as integers to keep the payload near 6 KB per frame.
+
+### Measuring the beats stack's alignment
+
+The Beats pane pins each wave on its own detected R so the stack superposes, but
+that only works if the *slice* put the complex in roughly the same place on
+every beat. When it does not, the stack fans out — and "it looks fanned" is not
+something you can iterate on.
+
+`tools/eval_beat_alignment.py` turns it into a number. It replays a recording
+through the real `HeartState` (same beat clock, same finder) and reports, per
+beat, where the true R ends up drawn relative to the shared line:
+
+```sh
+# provisional yardstick, from the recording's own R-R marks
+python tools/eval_beat_alignment.py recording/zrelay_20261108_020954.edf
+
+# against hand-tagged R positions (sample indices, as EDFbrowser reads out)
+python tools/eval_beat_alignment.py recording/x.edf --peaks peaks.txt --csv out.csv
+
+# any stretch, not just the tail: --start/--end scroll the replay window
+python tools/eval_beat_alignment.py recording/x.edf --start 380 --peaks peaks.txt
+```
+
+The stack holds only the last 64 beats of whatever is replayed, so a tag file
+that covers the *end* of the file needs no window; for any other stretch, pass
+`--start`. Tag offsets are in the recording's own timeline either way.
+
+The two numbers that matter are `median |residual|` (a constant offset, which
+the anchoring hides — not a visual problem) and `residual MAD` (the *spread*,
+which is exactly the fan). The replay is deterministic, so two runs over the
+same file are directly comparable.
+
+`--auto` is not independent of the algorithm under test: it takes the beat
+*times* from the recording's `RR_MS` channel and only asks the ECG where the
+apex is near each mark, which is enough to rank two algorithms on one file but
+is not hand-tagged truth. Tag a stretch of peaks for a real benchmark.
+
+**What it already found.** On `zrelay_20261108_020954.edf` the slice is placed a
+median **97 ms** from the true R (p90 297 ms), with the errors split evenly
+either side — a scatter problem, not a bias. `WaveAnchor` is not the culprit:
+narrowing `MAX_PEAK_SHIFT` to 25 samples made the residual spread *worse*
+(3.6 → 8.6 samples), because the anchor was absorbing some of that scatter.
+
+The fan was fixed by changing where the beat comes from. The stack used to take
+the sensor's announcement as truth and only ask *where inside this known beat is
+its R* (`PeakFinder`, whole-codebase notes in `src/heart/ecg.py`). It now asks
+*is this a beat at all* — a port of EDFbrowser's Pan–Tompkins detector
+(`src/heart/qrs.py`, GPLv3, `filt/pt_qrs.c`), whose detected peak is the slice
+centre directly. Measured on `zrelay_20261108_125551_qrs.edf` against EDFbrowser's
+own annotations, through `HeartState`:
+
+| slice centre | median | MAD | within 2 samples | slice error |
+|---|---|---|---|---|
+| `PeakFinder` | 4.79 | 5.50 | 36 % | 226 ms |
+| QRS peak, used directly | **0.99** | **0.90** | **84 %** | **0.2 ms** |
+
+Feeding the detector's peak *back* through `PeakFinder` is worse than using it
+raw (1.66 samples of residual against 0.99): the refiner and the clock
+calibration exist to correct a peak derived from a sensor timestamp, and running
+them on a measured one just moves it. That is why the QRS path does no
+refinement at all. Below 200 Hz — where the port's refractory and integration
+windows are not defined — the stack falls back to `PeakFinder` unchanged.
 
 ### Troubleshooting
 
@@ -187,6 +386,7 @@ Edit `config.conf` to adjust:
 - Buffer size (max minutes to retain)
 - Update interval
 - DirCon server (`[dircon]`)
+- EDF recording (`[edf]`)
 - Heart graph defaults (`[heart]`) — each one is also settable from the page and
   that choice wins until the next restart:
 

@@ -20,6 +20,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Deque, List, Optional, Sequence, Tuple
 
+from .qrs import QrsDetector
+
 # Smallest peak-to-peak swing (uV) that counts as a beat in a search window.
 MIN_EXCURSION_UV = 1e-3
 
@@ -93,6 +95,22 @@ class EcgRing:
     _MAX_RATE_FACTOR = 1.6
     #: Longest wall step honoured in one frame, so a hiccup is not a leap.
     _MAX_DT_MS = 100.0
+    #: The strip's width is held at the value it had when it came on screen,
+    #: and only re-sized when the requested width drifts further than this.
+    #:
+    #: The width is `window_rr * mean_rr`, and mean_rr is a plain average over
+    #: the last 30 intervals, so it moves with every beat - and violently after
+    #: a noisy stretch. Re-sizing every frame moves BOTH edges: growing shows
+    #: older data that was never on screen, shrinking erases data that was,
+    #: while the playhead keeps advancing. On screen that reads as the left end
+    #: "progressing in the past" and then being wiped, repeating for as many
+    #: beats as it takes the old left edge to leave the view.
+    #:
+    #: 12% is loose enough that the normal beat-to-beat breathing of the mean
+    #: (a few percent) never triggers a resize, and tight enough that every
+    #: step between the width presets is followed: the closest pair, 8 and 10
+    #: mean-RRs, is 25% apart.
+    _WIDTH_TOLERANCE = 0.12
 
     def _init_playback(self) -> None:
         self._playhead_ms: Optional[float] = None
@@ -102,6 +120,7 @@ class EcgRing:
         self._feed_rate = 1.0
         self._batch_span_ms = 0.0
         self._lead_ema_ms: Optional[float] = None
+        self._width_ms: Optional[float] = None
         # Long baseline for the feed-rate estimate: (data_ms, wall_ms). See
         # `_learn_feed` for why one arrival interval is not enough.
         self._ref_data_ms: Optional[float] = None
@@ -236,6 +255,29 @@ class EcgRing:
         )
         target_lead = _clamp(target_lead, min(self._MIN_LEAD_MS, cap_lead), max(cap_lead, 1.0))
 
+        # A backlog beyond the ceiling is skipped, not scrolled through.
+        #
+        # The rate correction below only ever drains at _MAX_RATE_FACTOR times
+        # real time, so a backlog of N seconds took N/(factor-1) seconds of
+        # watching to clear - 50 s for a 30 s gap, and worse the longer the
+        # strip went undrawn. The ceiling is documented as bounding the latency
+        # the strip introduces, so enforce it rather than only steering with it.
+        #
+        # The allowance is the ceiling *plus one burst*: sitting a burst behind
+        # the newest sample is how the strip keeps moving through the gap
+        # between bursts, and a burst is legitimately up to a second of data.
+        # Only the excess past that is stale enough to be worth dropping.
+        #
+        # A tab switch is not the only way to earn this: a frozen strip, a
+        # stalled feed or a slow client all resume with a backlog.
+        limit = self._LATENCY_CEILING_MS + self._batch_span_ms
+        backlog = newest - self._playhead_ms
+        if backlog > limit:
+            self._playhead_ms = float(newest) - limit
+            # Re-seat the smoothing, or the stale lead drags the rate for the
+            # next half second and the strip visibly creeps.
+            self._lead_ema_ms = limit
+
         lead = newest - self._playhead_ms
         self._lead_ema_ms = (
             lead
@@ -344,6 +386,24 @@ class EcgRing:
 
     # -- windows ---------------------------------------------------------
 
+    def _stable_width_ms(self, requested_ms: float) -> float:
+        """
+        The width to draw, holding the previous value unless the request drifts.
+
+        Both edges of the strip follow this number, so changing it every frame
+        makes the left end move backwards (older data appears) or forwards
+        (data already shown is erased) while the right end advances. See
+        `_WIDTH_TOLERANCE` for why the request moves at all.
+
+        Holding the width is not the same as hiding the change: once it does
+        exceed the tolerance the strip resizes once, deliberately, instead of
+        breathing every frame.
+        """
+        prev = self._width_ms
+        if prev is None or abs(requested_ms - prev) > prev * self._WIDTH_TOLERANCE:
+            self._width_ms = float(requested_ms)
+        return self._width_ms
+
     def window(self, window_ms: float, mean_rr_ms: float, wall_ms: Optional[float] = None) -> Optional[dict]:
         """
         The scrolling strip: the `window_ms` of samples that ends at the playhead.
@@ -360,6 +420,11 @@ class EcgRing:
             return None
         now_wall = time.monotonic() * 1000.0 if wall_ms is None else float(wall_ms)
         self._advance_playhead(now_wall)
+
+        # Hold the width still while the strip is on screen. Using the raw
+        # request would resize it on every beat, which drags the left edge
+        # backwards whenever mean_rr rises. See `_stable_width_ms`.
+        window_ms = self._stable_width_ms(window_ms)
 
         times, values = self._lists()
         newest = times[-1]
@@ -734,6 +799,13 @@ class WaveAnchor:
     MIN_PEAK_UV = 1e-3
 
     #: Largest shift, in grid samples, between the nominal centre and the peak.
+    #:
+    #: Measured, not guessed — `tools/eval_beat_alignment.py` is the measurement.
+    #: Narrowing this to 25 samples makes the residual spread *worse* (3.6 -> 8.6
+    #: samples), so the reach is not what fans the stack out. What does is the
+    #: slice itself: on the 2026-11-08 recording the finder places the window a
+    #: median 97 ms from the true R, with the errors split evenly either side, so
+    #: no fixed bound can correct it. Fix the slice placement, not this.
     MAX_PEAK_SHIFT = 80
 
     @staticmethod
@@ -838,6 +910,221 @@ class _Peak:
     count: int
 
 
+class QrsBeatSource:
+    """
+    Reference point of each beat, from the waveform itself.
+
+    This replaces `PeakFinder` on streams the QRS detector can run on, which is
+    every ECG at or above 200 Hz — the live dongle is at 256 Hz. The difference
+    is not a better search window, it is a different question. `PeakFinder` took
+    the sensor's beat announcement as truth and only asked *where inside this
+    known beat is its R*, answering with the largest excursion from a local
+    median. Pan–Tompkins asks *is this a beat at all*, from a slope-energy
+    envelope with adaptive thresholds, so a T wave taller than a low R, a
+    baseline swing or motion noise does not win a beat.
+
+    Measured on `recording/zrelay_20261108_125551_qrs.edf` against EDFbrowser's
+    own annotations, driving the beats stack through `HeartState`:
+
+    =========================  =========  =========  ===============  ============
+    slice centre               median     MAD        within 2 samples slice error
+    =========================  =========  =========  ===============  ============
+    `PeakFinder`               7.98       7.95       19 %             214 ms
+    QRS peak + `PeakFinder`    1.66       1.02       54 %             145 ms
+    QRS peak, used directly    1.18       0.59       79 %              26 ms
+    =========================  =========  =========  ===============  ============
+
+    The third row is why this class does no refinement and no clock
+    calibration. Those exist in `PeakFinder` to correct a peak that came from a
+    sensor timestamp; once the peak is measured from the waveform they have
+    nothing left to correct, and running them anyway *moves a correct peak* —
+    row two is row three with the old machinery put back on top.
+
+    It also works without the sensor. The strap reports no beats at all across
+    two 40 s stretches of that recording while the ECG keeps coming; a beat
+    source anchored on the strap's announcements cannot draw them, and this one
+    does (753 complexes against 719 announced).
+    """
+
+    #: The detector is only defined on 200 Hz and up (its refractory period and
+    #: integration window are counted in 200 Hz samples). Below that the caller
+    #: falls back to `PeakFinder`.
+    MIN_FS_HZ = 200.0
+
+    #: Measured R times retained. The stack only ever asks about recent beats,
+    #: but `locate` searches this list, so it holds far more than one screen.
+    HISTORY = 512
+
+    def __init__(self, fs_hz: float) -> None:
+        self.fs_hz = float(fs_hz)
+        self.ms_per_sample = 1000.0 / self.fs_hz
+        self._detector = QrsDetector(self.fs_hz, sense=1.0)
+        #: Index, in pushed samples, of the next sample the detector will see.
+        self._fed = 0
+        #: Ring timestamp of each sample pushed, so a peak can be put on the
+        #: ring's clock by *looking its time up* rather than computing it from
+        #: the sample index.
+        #:
+        #: This is not a roundabout way of doing arithmetic. The index only maps
+        #: to time linearly if every sample arrives, and live they do not: on a
+        #: real session the dongle delivered 7 635 samples across 72 s of stamps,
+        #: so 60 % of the ECG was missing in gaps between bursts. Timing a peak
+        #: as `first_stamp + index * period` then places it progressively earlier
+        #: than it really is — measured at 31 samples (121 ms) on that session,
+        #: which pushes the R a third of a window right of centre and makes the
+        #: stack look misaligned. A replay of a recorded file has no gaps, so it
+        #: shows none of this and would hide the bug.
+        #: Deep enough for the longest report lag (a search-back beat can arrive
+        #: ~1.2 s late, 300 samples at 256 Hz); 2048 is ~8 s at 256 Hz.
+        self._fed_times: Deque[int] = deque(maxlen=2048)
+        self._found: Deque[float] = deque(maxlen=self.HISTORY)
+        self._lags: Deque[int] = deque(maxlen=64)
+        #: Peaks found while pushing, waiting to be handed out by `detect`.
+        self._new: List[float] = []
+
+    @classmethod
+    def supports(cls, fs_hz: float) -> bool:
+        return fs_hz >= cls.MIN_FS_HZ
+
+    def reset(self) -> None:
+        self._detector.reset()
+        self._fed = 0
+        self._fed_times.clear()
+        self._found.clear()
+        self._lags.clear()
+        self._new.clear()
+
+    #: Delay to assume before any beat has been measured, ms. The reference's
+    #: own 21-sample compensation at 200 Hz, plus the peak search's walk-back,
+    #: which is what the measured figure settles at on real data.
+    NOMINAL_LAG_MS = 170
+
+    def lag_ms(self) -> int:
+        """
+        How far behind the newest sample a peak is when it is reported.
+
+        The detector's compensation (`del_comp`, 21 samples at 200 Hz) is only
+        part of it: the peak search also walks back to the apex of the complex,
+        which adds about another 11 samples at 200 Hz. Measured on the annotated
+        capture the total is a flat 41 samples at 256 Hz (160 ms), so the figure
+        is *measured* here rather than derived — deriving it from `del_comp`
+        alone understates it by half, and a look-ahead that is too short lets a
+        wave be sliced against a tail that has not arrived.
+
+        The contract is deliberately one-sided: too short breaks waves, too long
+        only delays them.
+        """
+        if self._lags:
+            return int(math.ceil(self.median_lag_ms())) + 1
+        return self.NOMINAL_LAG_MS
+
+    def feed(self, samples_uv: Sequence[float], start_ms: Optional[int] = None) -> None:
+        """
+        Consume new ECG samples and record any beats found in them.
+
+        Only samples never fed before are read, so this is safe to call with
+        whatever the ring currently holds: the ring's own history is retained,
+        so the caller does not have to track how much is new.
+
+        `start_ms` is the ring time of the first sample in `samples_uv`. Each
+        sample's own time is recorded as it is pushed, so a peak is dated from
+        the sample it actually sits on. Timing it from the sample index instead
+        would be wrong on any stream with gaps — see `_fed_times`.
+        """
+        times = self._sample_times(len(samples_uv), start_ms)
+        for value, t_ms in zip(samples_uv, times):
+            # Absolute sample index of the R just found, or None. Not an offset:
+            # `QrsDetector` has already applied the detector's own delay.
+            peak_index = self._detector.push(value)
+            index = self._fed
+            self._fed += 1
+            self._fed_times.append(int(t_ms))
+            if peak_index is None or peak_index < 0:
+                continue
+            self._lags.append(index - peak_index)
+            peak_ms = float(self._time_of(peak_index))
+            self._found.append(peak_ms)
+            self._new.append(peak_ms)
+
+    def _sample_times(self, count: int, start_ms: Optional[int]) -> List[int]:
+        """
+        Ring time of each of `count` samples starting at `start_ms`.
+
+        `start_ms` is authoritative when given. Without it the times continue
+        from the last sample fed — which keeps a caller that omits it working,
+        at the cost of assuming contiguous arrival.
+        """
+        if start_ms is not None:
+            base = int(start_ms)
+        elif self._fed_times:
+            base = self._fed_times[-1] + int(round(self.ms_per_sample))
+        else:
+            base = 0
+        step = self.ms_per_sample
+        return [base + int(round(i * step)) for i in range(count)]
+
+    def _time_of(self, index: int) -> int:
+        """
+        Ring time of the sample at `index`, or the closest estimate if it has
+        aged out of the retained times.
+
+        The detector is now several seconds ahead of where it reports, so this
+        looks back at most `lag_ms()`. The fallback extrapolates from the oldest
+        retained sample rather than from sample 0, which keeps it right within
+        one lag window even when history has expired.
+        """
+        offset = self._fed - 1 - index
+        if 0 <= offset < len(self._fed_times):
+            return self._fed_times[len(self._fed_times) - 1 - offset]
+        if not self._fed_times:
+            return int(round(index * self.ms_per_sample))
+        oldest_index = self._fed - len(self._fed_times)
+        return self._fed_times[0] + int(round((index - oldest_index) * self.ms_per_sample))
+
+    def detect(self) -> List[float]:
+        """R times recorded since the last call, oldest first."""
+        if not self._new:
+            return []
+        out = self._new
+        self._new = []
+        return out
+
+    def beats(self) -> List[float]:
+        """Every R time still in history, oldest first."""
+        return list(self._found)
+
+    def median_lag_ms(self) -> float:
+        """The measured report delay, ms. Falls back to the nominal `lag_ms`."""
+        if not self._lags:
+            return float(self.lag_ms())
+        ordered = sorted(self._lags)
+        return ordered[len(ordered) // 2] * self.ms_per_sample
+
+    def locate(self, expected_ms: int) -> float:
+        """
+        The measured R time nearest `expected_ms`.
+
+        Kept so this is a drop-in for `PeakFinder.locate`; the value is already
+        exact, so this selects a measurement rather than making one. Nearest
+        within half a beat, so a caller asking about a beat the detector placed
+        slightly differently still gets that beat and not its neighbour. With
+        nothing in range the expected time stands — a beat the detector has not
+        reached yet must not be silently moved onto a different one.
+        """
+        if not self._found:
+            return float(expected_ms)
+        nearest = min(self._found, key=lambda t: abs(t - expected_ms))
+        if abs(nearest - expected_ms) <= 0.5 * self._mean_rr_ms():
+            return float(nearest)
+        return float(expected_ms)
+
+    def _mean_rr_ms(self) -> float:
+        peaks = self._found
+        if len(peaks) < 2:
+            return 800.0
+        return (peaks[-1] - peaks[0]) / float(len(peaks) - 1)
+
+
 class PeakFinder:
     """
     Reference point of one beat for the beats plot, from the sensor's RR stream.
@@ -874,7 +1161,8 @@ class PeakFinder:
         #
         # The tracking chain advances by one sensor R–R, but that interval is
         # measured in *real* time while the chain lives on the ECG sample clock.
-        # The two are not the same clock: the dongle stamps 125 Hz, and on a
+        # The two are not the same clock: the dongle stamps the strap's own rate
+        # (125 Hz on the recordings that exposed this), and on a
         # captured recording the R peaks came out 6.1% closer in stamped ms than
         # the sensor's own R–R (median 1088 ms against 1159 ms, per-beat spread
         # only 3%). Advancing by the raw interval therefore overshot the next R
@@ -1082,10 +1370,11 @@ class PeakFinder:
         Where the peak lies between the samples, in ms.
 
         The pick is necessarily a whole sample, so on its own it can only be right
-        to half a step — 4 ms at 125 Hz — and that error lands directly in the
-        drawn stack, shifting each wave against its neighbours. Fitting a parabola
-        through the apex and the samples either side recovers where between them
-        the true vertex sits, which takes the anchor off the sample grid.
+        to half a step — 2 ms at 256 Hz, 4 ms at 125 Hz — and that error lands
+        directly in the drawn stack, shifting each wave against its neighbours.
+        Fitting a parabola through the apex and the samples either side recovers
+        where between them the true vertex sits, which takes the anchor off the
+        sample grid.
 
         The apex triplet, not a fit to the two flanks: chords through the upstroke
         and the downstroke have nearly the same slope on a QRS, so their
@@ -1206,11 +1495,26 @@ class PeakFinder:
 
 class BeatOverlay:
     """
-    Stack of drawn beats: one wave per sensor interval, centred on the beat's
-    reference point found by PeakFinder.
+    Stack of drawn beats: one wave per beat, centred on where its R actually is.
+
+    Two beat sources, and which one is in use is the difference between a stack
+    that superposes and one that fans out:
+
+    * `QrsBeatSource` (default on ECG at 200 Hz and up, so the live 256 Hz
+      dongle): the beats are *detected* from the waveform, and the detected peak
+      is the slice centre directly. This is the accurate path — see the table in
+      `QrsBeatSource` for the measurement.
+    * `PeakFinder` (below 200 Hz, where the QRS algorithm's own assumptions do
+      not hold): the beats are the sensor's announcements, and the finder
+      measures where inside each one its R sits.
+
+    On the QRS path `on_beat` is not what creates waves — the ECG is. That
+    matters beyond accuracy: the strap announces no beats at all across long
+    stretches of a real recording while the ECG keeps coming, and those beats
+    are simply not on the stack when the sensor is the trigger.
 
     A wave is committed one beat late, because its post-R part is only recorded
-    once the next beat arrives. The model is the median of the last
+    once enough ECG has arrived after R. The model is the median of the last
     `TEMPLATE_BEATS` committed waves, so a single distorted beat cannot drag the
     reference point of the following ones.
     """
@@ -1220,25 +1524,37 @@ class BeatOverlay:
     TEMPLATE_BEATS = 8
     TEMPLATE_MIN = 3
 
-    # Waves withheld after a connect or reset, while the sensor's beat clock is
-    # still settling against the ECG.
+    # Waves withheld after a connect or reset so the model has something to
+    # build the reference point from.
     WARMUP_BEATS = 3
 
-    def __init__(self, template: Optional[BeatTemplate] = None, peak_finder: Optional[PeakFinder] = None) -> None:
+    def __init__(
+        self,
+        template: Optional[BeatTemplate] = None,
+        peak_finder: Optional[PeakFinder] = None,
+        qrs_source: Optional[QrsBeatSource] = None,
+    ) -> None:
         self._template = template or BeatTemplate()
         self._peak_finder = peak_finder or PeakFinder()
+        self._qrs = qrs_source
         self._stack: Deque[Tuple[List[float], int]] = deque(maxlen=self.STACK_CAP)
         self._recent: Deque[List[float]] = deque(maxlen=self.TEMPLATE_BEATS)
         self._pending_ms: Optional[float] = None
         self._pending_wave: Optional[List[float]] = None
         #: Interval of the located, not-yet-committed beat.
         self._pending_rr = 0
-        #: Beats announced but not located yet, oldest first: (beat_ms, interval).
+        #: Beats detected but not committed yet, oldest first: (beat_ms, interval).
         self._queue: Deque[Tuple[int, int]] = deque()
         self._last_beat_ms: Optional[int] = None
         self._model: Optional[List[float]] = None
         self._commits = 0
         self._version = 0
+        #: Time of the newest ECG sample already handed to the QRS detector, so
+        #: each one is seen exactly once.
+        self._fed_upto_ms: Optional[int] = None
+        #: Time of the newest beat the detector reported, for measuring the next
+        #: interval. Separate from `_last_beat_ms`, which the sensor path owns.
+        self._last_detected_beat_ms: Optional[float] = None
 
     @property
     def version(self) -> int:
@@ -1254,8 +1570,65 @@ class BeatOverlay:
         self._last_beat_ms = None
         self._model = None
         self._commits = 0
+        self._fed_upto_ms = None
+        self._last_detected_beat_ms = None
         self._template.reset()
         self._peak_finder.reset()
+        if self._qrs is not None:
+            self._qrs.reset()
+        self._version += 1
+
+    def use_qrs(self, fs_hz: float) -> bool:
+        """
+        Switch to detecting beats from the waveform when the rate allows it.
+
+        A session can start before the dongle's real rate is known (the fallback
+        is 130 Hz) and settle at 256 Hz a packet later, so this is called on
+        every ECG packet and is a no-op once the decision is stable.
+        """
+        if not QrsBeatSource.supports(fs_hz):
+            return self._qrs is not None
+        if self._qrs is not None:
+            if abs(self._qrs.fs_hz - float(fs_hz)) < 1e-6:
+                return True
+            # A rate change means a different detector: its filters and its
+            # refractory window are counted in samples at this rate.
+            self._qrs = None
+        self._qrs = QrsBeatSource(fs_hz)
+        self._fed_upto_ms = None
+        self._last_detected_beat_ms = None
+        # The queue holds sensor-announced beats; the detector is the source now.
+        self._queue.clear()
+        self._pending_ms = None
+        self._pending_wave = None
+        self._pending_rr = 0
+        self._template.reset()
+        self._version += 1
+        return True
+
+    @property
+    def detecting(self) -> bool:
+        """True when beats come from the waveform rather than the sensor's."""
+        return self._qrs is not None
+
+    def disable_detector(self) -> None:
+        """
+        Fall back to the sensor-announced path, whatever the rate.
+
+        Only useful for comparing the two on the same recording — the detector is
+        the accurate path wherever it applies. Any beats already drawn stay as
+        they are; new ones come from the sensor again.
+        """
+        if self._qrs is None:
+            return
+        self._qrs = None
+        self._fed_upto_ms = None
+        self._last_detected_beat_ms = None
+        self._queue.clear()
+        self._pending_ms = None
+        self._pending_wave = None
+        self._pending_rr = 0
+        self._template.reset()
         self._version += 1
 
     def discard_pending(self) -> None:
@@ -1274,10 +1647,24 @@ class BeatOverlay:
     def buffered_count(self) -> int:
         return len(self._stack)
 
+    def detector_fed(self) -> Optional[int]:
+        """
+        Samples the QRS detector has consumed, or None when it is not in use.
+
+        Exposed for the status line: it should track the session's own ECG sample
+        count. A gap between the two means the feed is skipping, which shifts
+        every detected peak against the ring's clock.
+        """
+        if self._qrs is None:
+            return None
+        return self._qrs._fed  # noqa: SLF001 - a diagnostic counter, not state
+
     def template(self) -> Optional[List[float]]:
         return self._model
 
     def lag_ms(self) -> int:
+        if self._qrs is not None:
+            return self._qrs.lag_ms()
         return self._peak_finder.lag_ms()
 
     def on_beat(self, ecg: EcgRing, beat_ms: int, sensor_rr_ms: int = 0) -> bool:
@@ -1288,7 +1675,18 @@ class BeatOverlay:
         what sizes the window and what the reference chain advances by. Returns
         True when the *drawn* stack changed; the first `WARMUP_BEATS` completions
         feed the model but are not drawn.
+
+        When the QRS detector is driving, this is only a hint: the waveform is
+        what says a beat happened and where it is, so an announcement must not
+        add a wave of its own or the same beat would be drawn twice. It still
+        feeds the width EMA, which the sensor measures better than a
+        peak-to-peak interval does.
         """
+        if self._qrs is not None:
+            if sensor_rr_ms > 0:
+                self._template.observe_rr(float(sensor_rr_ms))
+            return self.pump(ecg)
+
         prev = self._last_beat_ms
         self._last_beat_ms = beat_ms
         if sensor_rr_ms > 0:
@@ -1315,10 +1713,14 @@ class BeatOverlay:
         Advance the beat queue as far as the recorded ECG allows.
 
         Called when a beat is announced *and* when ECG arrives, so the queue never
-        stalls: the look-ahead a beat needs is usually a packet away.
+        stalls: the look-ahead a beat needs is usually a packet away. On the QRS
+        path this is also where the detector is fed, because the beats it finds
+        are the queue.
         """
+        if self._qrs is not None:
+            self._feed_detector(ecg)
+
         changed = False
-        lookahead = self._peak_finder.lookahead_ms(self._template.current_window())
         while True:
             newest = ecg.newest_ms
             if newest is None:
@@ -1336,20 +1738,76 @@ class BeatOverlay:
             if not self._queue:
                 return changed
             beat_ms, rr = self._queue[0]
-            if newest < beat_ms + lookahead:
-                return changed
-            self._queue.popleft()
-            self._pending_ms = float(
-                self._peak_finder.locate(
+            # On the QRS path the peak is already measured from the waveform, so
+            # there is nothing to locate — only the wave's tail has to exist,
+            # which `_commit` checks. On the sensor path the finder still needs
+            # its look-ahead before it can name an R.
+            if self._qrs is None:
+                lookahead = self._peak_finder.lookahead_ms(self._template.current_window())
+                if newest < beat_ms + lookahead:
+                    return changed
+                self._queue.popleft()
+                located = self._peak_finder.locate(
                     ecg,
                     beat_ms,
                     self._model,
                     self._template.current_window(),
                     rr,
                 )
-            )
+            else:
+                # The detector could not have reported this peak before its whole
+                # look-ahead had been consumed, so by now the samples are there.
+                # The check is still made, because a beat can also be queued by a
+                # caller that fed the detector less than it claims.
+                if newest < beat_ms + self._qrs.lag_ms():
+                    return changed
+                self._queue.popleft()
+                located = float(beat_ms)
+            self._pending_ms = float(located)
             self._pending_rr = rr
             self._pending_wave = self._template.from_ecg(ecg, self._pending_ms)
+
+    def _feed_detector(self, ecg: EcgRing) -> None:
+        """
+        Hand the QRS detector every ECG sample it has not seen, and queue the
+        beats it reports.
+
+        The ring keeps its own history, so the only bookkeeping needed is a mark
+        of how far the detector has already read. Feeding it twice would make it
+        see each complex twice and detection collapse; skipping samples would
+        open a hole in the filter state.
+        """
+        assert self._qrs is not None
+        newest = ecg.newest_ms
+        if newest is None:
+            return
+        if self._fed_upto_ms is not None and newest <= self._fed_upto_ms:
+            return
+
+        start_ms = 0 if self._fed_upto_ms is None else self._fed_upto_ms + 1
+        lo, hi = ecg.band(start_ms, newest)
+        if hi <= lo:
+            return
+        _, values = ecg._lists()  # noqa: SLF001 - the ring is this module's own
+        # The ring's own time for the first sample handed over, so the detector's
+        # sample indices become comparable with `beat_ms` and with the ring.
+        self._qrs.feed(values[lo:hi], start_ms=ecg.time_at(lo))
+        self._fed_upto_ms = newest
+
+        for beat_ms in self._qrs.detect():
+            # The previous beat is the one this detector reported last, which is
+            # not `_last_beat_ms`: that field is set by `on_beat`, and on this
+            # path the sensor's announcements do not create beats at all. Using
+            # it made every interval after the queue drained come out zero, so
+            # the traces were drawn with no width.
+            prev = self._last_detected_beat_ms
+            rr = int(round(beat_ms - prev)) if prev is not None and beat_ms > prev else 0
+            if rr > 0:
+                # The drawn width follows the interval the beats *actually* have,
+                # which on this path is measured rather than announced.
+                self._template.observe_rr(float(rr))
+            self._queue.append((int(round(beat_ms)), rr))
+            self._last_detected_beat_ms = beat_ms
 
     def _commit(self, ecg: EcgRing) -> bool:
         """Commit the located beat whose entire window is now recorded."""
@@ -1370,12 +1828,25 @@ class BeatOverlay:
         # real-ms intervals, which put them up to a third of a QRS off the ones
         # that follow — visible as a few strays at the left of an otherwise
         # superposed stack.
-        if self._commits >= self.WARMUP_BEATS and self._peak_finder.timebase_ready():
+        if self._commits >= self.WARMUP_BEATS and self._clock_ready():
             self._stack.append((wave, self._pending_rr))
             changed = True
             self._version += 1
         self._commits += 1
         return changed
+
+    def _clock_ready(self) -> bool:
+        """
+        Whether the beat reference point is trustworthy enough to draw.
+
+        Only `PeakFinder` has a settling clock (it calibrates the ECG's own rate
+        against the sensor's intervals), so only it can withhold waves. A
+        detected peak IS the measurement — there is no clock to settle — so
+        gating on one would just delay the first waves for no reason.
+        """
+        if self._qrs is not None:
+            return True
+        return self._peak_finder.timebase_ready()
 
 def median_wave(waves: Sequence[Sequence[float]]) -> List[float]:
     n = len(waves[0])

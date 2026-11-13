@@ -1,12 +1,20 @@
 """
 Data buffer for storing and retrieving time-windowed sensor data.
 """
+import logging
 import threading
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 class DataBuffer:
     """Thread-safe rolling buffer for sensor data with time window support."""
+
+    # A rewind larger than this means the dongle restarted its uptime clock.
+    # Normal jitter and out-of-order points between device threads are far
+    # smaller; the dongle's loop counter restarts at 0 on every boot.
+    RESTART_THRESHOLD_MS = 5_000
     
     def __init__(self, max_minutes: int = 60):
         """
@@ -49,12 +57,39 @@ class DataBuffer:
             return
         
         with self.lock:
+            # Timestamps are the dongle's uptime, which restarts from zero when
+            # it reboots. After that every new point lands far behind
+            # latest_timestamp_ms, so the monotonic update below would pin the
+            # clock at the old session's value forever (_cleanup_old_data is
+            # anchored on it too, so nothing aged out either). The buffer then
+            # reports "now" as a time no new point can reach, and every window
+            # ends before the data: exactly the frozen dashboard, while serial
+            # data kept arriving the whole time.
+            #
+            # Only a large rewind is treated as a reboot. Late points from the
+            # current session arrive slightly behind the clock and must not
+            # wipe the buffer.
+            if (self.latest_timestamp_ms > 0
+                    and timestamp_ms < self.latest_timestamp_ms
+                    and self.latest_timestamp_ms - timestamp_ms > self.RESTART_THRESHOLD_MS):
+                logger.warning(
+                    "Dongle clock went backwards (%d -> %d ms): restarting the "
+                    "buffer, the dongle most likely rebooted",
+                    self.latest_timestamp_ms, timestamp_ms)
+                self._restart_locked(timestamp_ms)
+
             # Update latest timestamp
             if timestamp_ms > self.latest_timestamp_ms:
                 self.latest_timestamp_ms = timestamp_ms
             
             self.buffers[metric].append((timestamp_ms, value))
             self._cleanup_old_data()
+
+    def _restart_locked(self, first_timestamp_ms: int):
+        """Drop the previous session's data and re-anchor the clock."""
+        for metric in self.buffers:
+            self.buffers[metric] = []
+        self.latest_timestamp_ms = first_timestamp_ms
     
     def get_data_for_window(self, window_minutes: int) -> Dict[str, List[Tuple[int, float]]]:
         """

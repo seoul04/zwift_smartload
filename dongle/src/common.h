@@ -63,7 +63,9 @@ void announce_identity(void);
  * 80 * 12 + 64 header/trailer leaves comfortable headroom. */
 #define ECG_RECORD_MAX (ECG_MAX_SAMPLES * 12 + 64)
 
-/* GSP continuation buffer: one SBEM frame, comfortably above a 125 Hz ECG packet. */
+/* GSP continuation buffer: one SBEM frame, comfortably above an ECG packet.
+ * A notification carries at most ~20 samples at any supported rate, so the
+ * frame size is set by the MTU, not by the sample rate. */
 #define GSP_BUF_SIZE 200
 
 /* What a subscription delivers, decided by the characteristic UUID rather than by
@@ -149,8 +151,47 @@ struct conn_slot {
 	struct bt_gatt_write_params write_params;
 	uint8_t gsp_ref_ecg;            /* GSP client reference for the ECG stream */
 	uint8_t gsp_ref_hr;             /* GSP client reference for /Meas/HR */
+	/* References from the previous connection. Kept after a reset so the next
+	 * connection can unsubscribe them; otherwise the sensor keeps streaming
+	 * under the old reference for the life of its own session. */
+	uint8_t gsp_ref_ecg_prev;
+	uint8_t gsp_ref_hr_prev;
 	uint8_t gsp_ecg_started;
 	uint32_t ecg_dropped;           /* ECG records discarded when the console could not take them */
+	/* Stream health counters, reported periodically by ecg_stream.c. They are
+	 * deltas rather than lifetime totals so the health line shows the live
+	 * rate; a stalled stream then reads as 0/s instead of an average that
+	 * hides the stall. */
+	uint32_t ecg_frames;            /* records emitted on this connection */
+	uint32_t ecg_samples;           /* samples emitted on this connection */
+	uint32_t ecg_last_frame_ms;     /* uptime of the last emitted record, 0 = none yet */
+	uint32_t ecg_gap_ms_max;        /* largest silence between two records */
+	/* Ingress counters. An emitted record can only be as trustworthy as the
+	 * count of notifications behind it, and the two were indistinguishable
+	 * while debugging: a stalled stream and a stream whose records are being
+	 * dropped on the way out both look like "the console went quiet". */
+	uint32_t gsp_notifs;            /* GSP notifications received */
+	uint32_t gsp_frames_done;       /* complete SBEM frames handed to the parser */
+	uint32_t gsp_frames_unknown;    /* frames whose reference matched neither stream */
+	/* Notifications of every kind on this slot. If GSP stops but HRS keeps
+	 * arriving, the sensor ended the ECG measurement and the link is fine. If
+	 * everything stops while the connection stays up, the host's receive path
+	 * has stalled - the controller keeps the link alive on its own, so the two
+	 * cases look identical from the outside without this counter. */
+	uint32_t all_notifs;
+	uint32_t hr_notifs;
+	/* Watchdog state. The sensor ends the ECG measurement while the link stays
+	 * up and HRS keeps notifying, so silence is indistinguishable from "the
+	 * strap is off" unless the firmware remembers when it last covered the
+	 * stream. Without a deadline nothing ever restarts it. */
+	uint32_t ecg_start_ms;          /* uptime when the stream was requested */
+	uint8_t gsp_restarts;           /* watchdog re-subscribes on this connection */
+	/* Last GSP outcome, so the response handler can log what it was answering
+	 * instead of a bare status with no provenance. */
+	uint8_t gsp_last_cmd;           /* GSP_CMD_* of the last command written */
+	uint8_t gsp_last_ref;           /* reference of the last command written */
+	uint8_t gsp_unsub_status;       /* HTTP status of the last UNSUBSCRIBE, 0 = not answered */
+	uint8_t gsp_conflict;           /* a SUBSCRIBE was refused with 409 on this connection */
 	/* GSP DATA_PART2 reassembly */
 	uint8_t gsp_buf[GSP_BUF_SIZE];
 	uint16_t gsp_len;
@@ -159,6 +200,7 @@ struct conn_slot {
 	/* ECG sample clock: anchored on the first packet, then advanced by the
 	 * sample period so BLE arrival jitter never reaches the trace. */
 	uint32_t ecg_t0_ms;
+	uint16_t ecg_acc;       /* remainder of count*1000/fs_hz, carried between packets */
 	uint8_t ecg_clock_valid;
 	uint8_t hr_rr_misses;   /* consecutive HRS packets without RR, for the GSP fallback */
 	uint8_t mtu_logged;

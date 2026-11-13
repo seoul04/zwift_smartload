@@ -524,6 +524,149 @@ def test_ecg_strip_scrolls_sub_sample_so_peaks_do_not_step():
     assert any(0.0 < f["left_fraction"] < 1.0 for f in frames[50:])
 
 
+def test_ecg_strip_width_does_not_breathe_with_the_rr_average():
+    """
+    The strip's width must not follow mean_rr frame by frame.
+
+    The width is `window_rr * mean_rr` and mean_rr is a plain mean over the
+    last 30 intervals, so it moves with every beat - sharply after a noisy
+    stretch. Both edges of the window are derived from the width, so resizing
+    every frame drags the LEFT edge backwards (older data appears from nowhere)
+    and then forwards (data already on screen is erased) while the right edge
+    keeps advancing. On the screen that reads as the left end scrolling in the
+    past and being wiped, repeating for several beats.
+    """
+    ring = EcgRing(fs_hz=256.0)
+    t = 0
+    wall = 1000.0
+    for _ in range(20):
+        ring.push([100.0] * 256, t, wall_ms=wall)
+        t += 1000
+        wall += 1000.0
+
+    # Settle the strip, then walk mean_rr through a realistic post-artifact
+    # swing: a few percent each way, never a genuine change of width.
+    ring.window(9500.0, 950.0, wall_ms=wall)
+    starts = []
+    for mean_rr in (950, 960, 970, 985, 1000, 1015, 1030, 1020, 1000, 980, 955):
+        wall += 33.0
+        frame = ring.window(10.0 * mean_rr, float(mean_rr), wall_ms=wall)
+        starts.append(frame["t0_ms"])
+
+    assert len(set(starts)) == 1, (
+        f"the left edge moved with the R-R average: {starts}"
+    )
+
+
+def test_ecg_strip_resizes_once_for_a_genuine_width_change():
+    """
+    Holding the width must not mean ignoring it.
+
+    A real change - a different preset, or a heart rate far from the held
+    width - still resizes the strip, once, instead of breathing every frame.
+    """
+    ring = EcgRing(fs_hz=256.0)
+    t = 0
+    wall = 1000.0
+    for _ in range(20):
+        ring.push([100.0] * 256, t, wall_ms=wall)
+        t += 1000
+        wall += 1000.0
+
+    first = ring.window(9500.0, 950.0, wall_ms=wall)
+    assert abs(first["window_ms"] - 9500.0) < 1.0
+
+    # 1300 ms is 37% away from the held width, past _WIDTH_TOLERANCE.
+    wall += 33.0
+    changed = ring.window(13000.0, 1300.0, wall_ms=wall)
+    assert abs(changed["window_ms"] - 13000.0) < 1.0
+    assert changed["t0_ms"] < first["t0_ms"], "a wider strip reaches further back"
+
+
+def test_ecg_strip_skips_a_backlog_instead_of_replaying_it():
+    """
+    Returning to the ECG tab must show live data, not scroll through the gap.
+
+    While the tab is hidden the client stops asking for frames but the ring
+    keeps filling, so the strip resumes with `newest - playhead` seconds of
+    backlog. The smooth rate correction drains that at only _MAX_RATE_FACTOR
+    times real time - a 30 s gap took 50 s of watching, and a longer absence
+    was effectively never caught up. The ceiling then bounds it.
+    """
+    ring = EcgRing(fs_hz=256.0)
+    t = 0
+    wall = 0.0
+    for _ in range(120):
+        ring.push([100.0] * 256, t, wall_ms=wall)
+        t += 1000
+        wall += 1000.0
+
+    # One frame to seat the playhead, then 20 s of data with no frame drawn.
+    ring.window(9500.0, 950.0, wall_ms=wall)
+    for _ in range(20):
+        ring.push([100.0] * 256, t, wall_ms=wall)
+        t += 1000
+        wall += 1000.0
+
+    # The first frame after the switch back must already be near live.
+    wall += 16.0
+    frame = ring.window(9500.0, 950.0, wall_ms=wall)
+    lead = frame["newest_ms"] - frame["playhead_ms"]
+    # The allowance is the ceiling plus one burst of lag, not an unbounded wait.
+    limit = ring._LATENCY_CEILING_MS + 6000.0
+    assert lead <= limit, f"resumed {lead/1000:.1f} s behind live"
+
+
+def test_ecg_strip_does_not_jump_without_a_backlog():
+    """The ceiling must not fire on a healthy stream: no visible resync."""
+    ring = EcgRing(fs_hz=256.0)
+    t = 0
+    wall = 0.0
+    for _ in range(30):
+        ring.push([100.0] * 256, t, wall_ms=wall)
+        t += 1000
+        wall += 1000.0
+
+    jumps = []
+    prev = None
+    for _ in range(120):
+        wall += 16.0
+        frame = ring.window(9500.0, 950.0, wall_ms=wall)
+        if prev is not None:
+            jumps.append(frame["playhead_ms"] - prev)
+        prev = frame["playhead_ms"]
+    assert all(j >= 0 for j in jumps), "the clock never runs backwards"
+    assert max(jumps) <= 40, f"a frame jumped {max(jumps)} ms with no backlog"
+
+
+def test_ecg_strip_follows_every_width_preset_step():
+    """
+    Holding the width must not swallow a preset change.
+
+    The presets are mean-RR multiples; the closest pair (8 and 10) is 25%
+    apart, so the tolerance has to stay well below that or a step would be
+    ignored and the strip would keep the old width.
+    """
+    ring = EcgRing(fs_hz=256.0)
+    t = 0
+    wall = 1000.0
+    for _ in range(20):
+        ring.push([100.0] * 256, t, wall_ms=wall)
+        t += 1000
+        wall += 1000.0
+
+    mean_rr = 950.0
+    # The width snaps to whole samples by design (the slip is never an
+    # interpolation), so allow up to half a sample of rounding.
+    slack = 0.5 * ring.ms_per_sample + 0.01
+    for multiples in (3.0, 5.0, 8.0, 10.0, 15.0, 20.0, 10.0, 8.0, 5.0):
+        wall += 33.0
+        frame = ring.window(multiples * mean_rr, mean_rr, wall_ms=wall)
+        assert abs(frame["window_ms"] - multiples * mean_rr) <= slack, (
+            f"{multiples} RR did not take: drew {frame['window_ms']:.0f} ms"
+        )
+
+
 def test_ecg_strip_never_draws_past_the_newest_sample():
     """With no new data the playhead parks on the newest sample, not beyond it."""
     ring = EcgRing(fs_hz=125.0)

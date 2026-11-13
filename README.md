@@ -68,7 +68,7 @@ python run.py
 
 The dashboard will be available at `http://localhost:5000`
 
-![Zwift Data Visualization Dashboard](pictures/screenshot_server.png)
+![Zwift Data Visualization Dashboard](pictures/2026-11-08_05-34.png)
 
 ## Project Structure
 

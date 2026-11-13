@@ -132,6 +132,38 @@ static void serial_cmd_process(const char *line)
 		 * indistinguishable from the boot-time announcement. */
 		log("[SERIAL] info requested by server\n");
 		announce_identity();
+	} else if (strcmp(cmd, "gsp_reset") == 0) {
+		/* Diagnostic: drop this side's subscription references without
+		 * touching the sensor, which reproduces the state that produces a
+		 * 409 - the sensor keeps streaming but the dongle no longer knows
+		 * the reference. It is the only way to exercise the reclaim path
+		 * without pulling the power or walking out of radio range. */
+		bool any = false;
+
+		for (int i = 0; i < MAX_CONNECTIONS; i++) {
+			if (!connections[i].conn) {
+				continue;
+			}
+
+			log("[SERIAL] gsp_reset slot %d: forgetting refs "
+			    "ecg=%u hr=%u (sensor keeps streaming)\n", i,
+			    connections[i].gsp_ref_ecg,
+			    connections[i].gsp_ref_hr);
+
+			/* Do NOT move them to _prev: that would make the next
+			 * connection try to unsubscribe a reference that is about to
+			 * be reclaimed anyway, and the point here is to force the 409
+			 * discovery path. */
+			connections[i].gsp_ref_ecg = 0;
+			connections[i].gsp_ref_hr = 0;
+			connections[i].gsp_conflict = 0;
+			connections[i].gsp_ecg_started = 0;
+			any = true;
+		}
+
+		if (!any) {
+			log("[SERIAL] gsp_reset: nothing connected\n");
+		}
 	} else {
 		log("[SERIAL] Unknown command: %s\n", cmd);
 	}

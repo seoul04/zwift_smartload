@@ -235,7 +235,14 @@ class TrendTrace:
 
     _HR_MIN_SPAN = 20.0
     _HR_FALLBACK = 140.0
-    _RMSSD_MIN_SPAN = 20.0
+
+    #: Top of the RMSSD axis, in ms. Pinned rather than auto-scaled so the
+    #: trends curves are read against the same yardstick as the RMSSD tiles,
+    #: which colour from 0 to 400 ms (`RmssdMapConfig.color_stops`). An
+    #: auto-scaled axis re-fitted a quiet session into the same plot height as
+    #: a stressed one, so the two panels disagreed about what "high" meant.
+    RMSSD_AXIS_MAX = 400.0
+    RMSSD_AXIS_STEP = 100.0
 
     def __init__(self, capacity: int = DEFAULT_CAPACITY) -> None:
         self.capacity = capacity
@@ -267,7 +274,8 @@ class TrendTrace:
         width_s = self.width_seconds
         window_ms = width_s * 1000.0
         if not self._points:
-            return TrendFrame([], [], [], [], 0, window_ms, now_ms, TrendAxis.empty(), TrendAxis.empty())
+            return TrendFrame([], [], [], [], 0, window_ms, now_ms,
+                              self._hr_axis([]), self._rmssd_axis())
 
         times: List[float] = []
         hr: List[float] = []
@@ -298,9 +306,19 @@ class TrendTrace:
             count=len(times),
             window_ms=window_ms,
             now_ms=end,
-            hr_axis=_axis_for([hr], self._HR_MIN_SPAN, floor_at_zero=False, fallback_max=self._HR_FALLBACK),
-            rmssd_axis=_axis_for([r30, r300], self._RMSSD_MIN_SPAN, floor_at_zero=True),
+            hr_axis=self._hr_axis(hr),
+            rmssd_axis=self._rmssd_axis(),
         )
+
+    def _hr_axis(self, hr: Sequence[float]) -> TrendAxis:
+        """Auto-fit: heart rate ranges too widely for a useful fixed scale."""
+        return _axis_for([hr], self._HR_MIN_SPAN, floor_at_zero=False,
+                         fallback_max=self._HR_FALLBACK)
+
+    @classmethod
+    def _rmssd_axis(cls) -> TrendAxis:
+        """Fixed 0..400 ms, matching the RMSSD tiles' colour range."""
+        return TrendAxis(0.0, cls.RMSSD_AXIS_MAX, cls.RMSSD_AXIS_STEP)
 
 
 def nice_step(raw: float) -> float:

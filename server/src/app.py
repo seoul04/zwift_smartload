@@ -15,6 +15,7 @@ from flask import Flask, jsonify, render_template, request
 
 from .data_buffer import DataBuffer
 from .dircon import DirconServer, DongleIdentity, MdnsAdvertiser, SensorState, build_device
+from .edf import EdfRecorder
 from .heart import HeartState
 from .serial_reader import SerialReader
 
@@ -43,13 +44,38 @@ serial_reader: SerialReader = None
 heart_state: Optional[HeartState] = None
 dircon_server: Optional[DirconServer] = None
 mdns_advertiser: Optional[MdnsAdvertiser] = None
+edf_recorder: Optional[EdfRecorder] = None
 
 # Device status tracking (RSSI, battery, and last seen timestamp)
+#
+# `last_seen_ms` is the dongle's own stamp, kept for display. `seen_monotonic_ms`
+# is *our* arrival clock and is what liveness is judged on: the dongle does not
+# stamp every packet from one clock (ECG and R-R use different ones, and they
+# drift apart), so comparing two dongle timestamps is not a valid age test.
 device_status = {
-    'hr': {'rssi': None, 'battery': None, 'last_seen_ms': None},
-    'cp': {'rssi': None, 'battery': None, 'last_seen_ms': None},
-    'ftms': {'rssi': None, 'battery': None, 'last_seen_ms': None}
+    'hr': {'rssi': None, 'battery': None, 'last_seen_ms': None,
+           'seen_monotonic_ms': None},
+    'cp': {'rssi': None, 'battery': None, 'last_seen_ms': None,
+           'seen_monotonic_ms': None},
+    'ftms': {'rssi': None, 'battery': None, 'last_seen_ms': None,
+             'seen_monotonic_ms': None}
 }
+
+
+def _mark_device_seen(device: str, dongle_ts: Optional[int]) -> None:
+    """
+    Note that a device just reported in, on both clocks.
+
+    The dongle stamp is kept only for display. Liveness uses `time.monotonic()`
+    because a device's packets can arrive on more than one dongle clock — ECG is
+    stamped from the firmware's sample clock, R-R from true uptime — and those
+    drift apart by minutes. Ageing one against the other is what made the header
+    LED flap between green and grey.
+    """
+    if device not in device_status:
+        return
+    device_status[device]['last_seen_ms'] = dongle_ts
+    device_status[device]['seen_monotonic_ms'] = time.monotonic() * 1000.0
 
 
 def load_config() -> Dict:
@@ -159,6 +185,10 @@ def init_dircon(dircon_config: Dict):
         # When forwarding, the dongle reports the grade itself with a "sim" line
         if not forward_control and cmd.grade is not None and data_buffer is not None:
             data_buffer.add_data_point('sim_grade', data_buffer.latest_timestamp_ms, float(cmd.grade))
+        # What Zwift asked for is recorded separately from what the trainer
+        # reports: the pair is what shows a control loop that is not tracking.
+        if edf_recorder is not None:
+            edf_recorder.on_control(cmd)
 
     bind_ip = dircon_config.get('bind_ip', '0.0.0.0')
     dircon_server = DirconServer(
@@ -194,7 +224,7 @@ def init_dircon(dircon_config: Dict):
 
 def init_app():
     """Initialize the application components."""
-    global data_buffer, serial_reader, heart_state
+    global data_buffer, serial_reader, heart_state, edf_recorder
     
     # Prevent double initialization
     if serial_reader is not None and serial_reader.running:
@@ -220,6 +250,26 @@ def init_app():
         side=int(heart_cfg.get('rmssd_side', 4)),
     )
     logger.info("Heart graphs initialized")
+
+    # EDF recording: an independent listener on the same parsed lines, so a
+    # session on disk holds exactly what the panels drew. Off by default in
+    # config.conf because a recording folder that fills up is worse than none.
+    edf_cfg = config.get('edf', {})
+    if edf_cfg.get('enabled', False):
+        recordings_dir = edf_cfg.get('folder', 'recordings')
+        if not os.path.isabs(recordings_dir):
+            recordings_dir = os.path.join(app_dir, recordings_dir)
+        edf_recorder = EdfRecorder(
+            folder=recordings_dir,
+            prefix=edf_cfg.get('prefix', 'zrelay'),
+            max_files=int(edf_cfg.get('max_files', 50)),
+            enabled=True,
+            fs_fallback=float(heart_cfg.get('fs_hz', 130)),
+        )
+        logger.info(f"EDF recording enabled -> {recordings_dir}")
+    else:
+        edf_recorder = None
+        logger.info("EDF recording disabled")
     
     # Initialize serial reader
     serial_port = config.get('dongle', {}).get('serial', '/dev/ttyACM0')
@@ -238,6 +288,9 @@ def init_app():
                     try:
                         data = serial_reader.data_queue.get(timeout=0.1)
                         if data:
+                            global _last_message_monotonic
+                            _last_message_monotonic = time.monotonic()
+
                             # Check for device events
                             event = data.get('event')
                             if event == 'device_seen':
@@ -246,21 +299,21 @@ def init_app():
                                 device = data.get('device')
                                 timestamp_ms = data.get('timestamp_ms')
                                 if device in device_status and timestamp_ms is not None:
-                                    device_status[device]['last_seen_ms'] = timestamp_ms
+                                    _mark_device_seen(device, timestamp_ms)
                             elif event == 'device_rssi':
                                 device = data.get('device')
                                 rssi = data.get('rssi')
                                 timestamp_ms = data.get('timestamp_ms')
                                 if device and rssi is not None:
                                     device_status[device]['rssi'] = rssi
-                                    device_status[device]['last_seen_ms'] = timestamp_ms
+                                    _mark_device_seen(device, timestamp_ms)
                             elif event == 'device_battery':
                                 device = data.get('device')
                                 battery = data.get('battery')
                                 timestamp_ms = data.get('timestamp_ms')
                                 if device and battery is not None:
                                     device_status[device]['battery'] = battery
-                                    device_status[device]['last_seen_ms'] = timestamp_ms
+                                    _mark_device_seen(device, timestamp_ms)
                             else:
                                 # Process metric data
                                 metric = data.get('metric')
@@ -287,6 +340,11 @@ def init_app():
     # split, and the raw listener is called before the metric queue is filled.
     serial_reader.raw_listeners.append(heart_state.on_message)
 
+    # Same data, second consumer. Registered independently of the heart panels
+    # so a session is still recorded when a strap sends no ECG at all.
+    if edf_recorder is not None:
+        serial_reader.raw_listeners.append(edf_recorder.on_message)
+
     # Start serial reader
     serial_reader.start()
     
@@ -304,6 +362,12 @@ def index():
     return render_template('index.html')
 
 
+def shutdown_edf():
+    """Finish the session in progress. Called from the SIGTERM/SIGINT handler."""
+    if edf_recorder is not None:
+        edf_recorder.close()
+
+
 def _serialize_buffer_data(data: Dict[str, List]) -> Dict:
     result = {}
     for metric, points in data.items():
@@ -312,6 +376,29 @@ def _serialize_buffer_data(data: Dict[str, List]) -> Dict:
             'values': [val for _, val in points],
         }
     return result
+
+
+# How long without a parsed dongle line before the UI stops claiming to be live.
+DATA_STALE_AFTER_S = 5.0
+
+# Set in process_serial_data() on every parsed message, in daemon wall time.
+_last_message_monotonic = None
+
+
+def data_staleness() -> Dict:
+    """Report whether dongle data is still arriving, measured against the clock.
+
+    The dongle's own timestamps cannot be used here: they restart at zero when
+    it reboots, and that is exactly the case where they are least trustworthy.
+    """
+    if _last_message_monotonic is None:
+        return {'data_stale': True, 'data_age_ms': None}
+
+    age_s = time.monotonic() - _last_message_monotonic
+    return {
+        'data_stale': age_s > DATA_STALE_AFTER_S,
+        'data_age_ms': int(age_s * 1000),
+    }
 
 
 @app.route('/api/data')
@@ -365,6 +452,28 @@ def get_metrics_config():
     """Get metrics configuration for the frontend."""
     config = load_metrics_config()
     return jsonify({'metrics_config': config})
+
+
+@app.route('/api/edf/status')
+def get_edf_status():
+    """What the EDF recorder is doing: current session, last file, failures."""
+    if edf_recorder is None:
+        return jsonify({'enabled': False})
+    return jsonify(edf_recorder.status())
+
+
+@app.route('/api/edf/close', methods=['POST'])
+def close_edf_session():
+    """
+    Finish the session in progress and start a new one on the next sample.
+
+    Recording is enabled from `config.conf`; this exists so a session can be
+    split without stopping the server, e.g. to keep one file per test case.
+    """
+    if edf_recorder is None:
+        return jsonify({'error': 'EDF recording is disabled'}), 404
+    edf_recorder.close()
+    return jsonify(edf_recorder.status())
 
 
 @app.route('/api/heart/status')
@@ -462,22 +571,33 @@ def set_heart_config():
 @app.route('/api/status')
 def get_status():
     """Get server and connection status."""
-    # Get the latest timestamp from data buffer to use as "current time"
-    # This is relative to dongle time, so we can compare with device timestamps
-    if data_buffer:
-        current_time_ms = data_buffer.latest_timestamp_ms
-    else:
-        current_time_ms = 0
-    
+    # Liveness is measured against the *host* clock, not the dongle's.
+    #
+    # It used to compare `last_seen_ms` with `data_buffer.latest_timestamp_ms`,
+    # on the assumption that every dongle timestamp shares one clock. They do
+    # not: ECG carries the firmware's own ECG sample clock (`ecg_t0_ms`), which
+    # is anchored on the first frame of the connection and free-runs against the
+    # sample count, while `hr` carries `k_uptime_get_32()` — true uptime at
+    # arrival. The two drift apart (measured 21 minutes apart on a live link),
+    # and both feed the `hr` device record, so `last_seen` alternated between a
+    # value 21 minutes "behind" and one "ahead". Whichever arrived last decided
+    # whether the LED was green, and it flapped every few seconds.
+    #
+    # Recording arrival time here makes the comparison clock-agnostic: it does
+    # not matter which dongle clock stamped the packet, only that the packet
+    # arrived.
+    now_monotonic_ms = time.monotonic() * 1000.0
+
     timeout_ms = 5000  # 5 seconds - devices are considered connected if seen in last 5 seconds
     devices = {}
     for device_name, status in device_status.items():
         last_seen = status['last_seen_ms']
-        if last_seen is not None and current_time_ms > 0:
-            is_connected = (current_time_ms - last_seen) < timeout_ms
+        seen_at = status.get('seen_monotonic_ms')
+        if seen_at is not None:
+            is_connected = (now_monotonic_ms - seen_at) < timeout_ms
         else:
             is_connected = False
-        
+
         devices[device_name] = {
             'connected': is_connected,
             'rssi': status['rssi'],
@@ -490,8 +610,16 @@ def get_status():
         'running': serial_reader.running if serial_reader else False,
         'port': serial_reader.port if serial_reader else None,
         'devices': devices,
-        'dircon': dircon_server.status() if dircon_server else None
+        'dircon': dircon_server.status() if dircon_server else None,
+        'edf': edf_recorder.status() if edf_recorder else None
     }
+
+    # Wall-clock staleness, not dongle time: 'connected' only means the serial
+    # port is open, which is still true when the dongle has gone quiet or the
+    # data clock stalled. Without this the page reports "Connected" forever
+    # while every value on it is frozen.
+    status.update(data_staleness())
+
     return jsonify(status)
 
 

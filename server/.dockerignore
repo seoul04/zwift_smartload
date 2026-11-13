@@ -1,16 +1,30 @@
 # Python
 **/__pycache__/
-__pycache__/
-*.py[cod]
+**/*.py[cod]
 *$py.class
 *.so
 .Python
 *.egg-info/
+.eggs/
 dist/
 build/
+*.whl
 .venv/
 venv/
 env/
+ENV/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Tests and dev-only tooling (never needed at runtime)
+tests/
+pytest.ini
+requirements-dev.txt
 
 # IDE
 .vscode/
@@ -19,16 +33,22 @@ env/
 *.swo
 *~
 
-# Logs
+# Logs and recorded samples
 *.log
-logs/
 *.log.*
+logs/
+sample.json
+playback_serial.py
+recording/
+# Live sessions: mounted from the host at runtime, never baked into the image.
+recordings/
+temp/
+*.tmp
 
-# Git
+# Git and Docker metadata
 .git/
 .gitignore
-
-# Docker
+.gitattributes
 docker/
 .dockerignore
 
@@ -36,10 +56,6 @@ docker/
 *.md
 project_description.md
 
-# Test files
-sample.json
-playback_serial.py
-
-# Temporary files
-temp/
-*.tmp
+# Local secrets / machine-specific config
+.env
+.env.*

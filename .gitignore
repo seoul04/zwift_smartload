@@ -37,6 +37,9 @@ log.log
 serial_log.json
 server/logs/
 
+# EDF sessions recorded by the server (large, and per-machine)
+server/recording/
+
 # IDE
 .vscode/
 .idea/

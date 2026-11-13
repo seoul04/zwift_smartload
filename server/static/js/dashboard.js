@@ -550,6 +550,15 @@ async function updateStatus() {
             indicator.classList.remove('connected');
             statusText.textContent = `Disconnected from ${result.port || 'serial port'}`;
         }
+
+        // The indicator above only reflects the serial port being open, so it
+        // stays green while the dongle has gone quiet or the server's clock has
+        // stalled - the exact state where every value freezes but the page
+        // still claims to be connected. Treat an old timestamp as a warning.
+        if (result.data_stale) {
+            indicator.classList.add('stale');
+            statusText.textContent = `No data for ${Math.round((result.data_age_ms || 0) / 1000)}s`;
+        }
         
         // Update device status
         const deviceStatusContainer = document.getElementById('device-status');
@@ -565,10 +574,16 @@ async function updateStatus() {
                     
                     const indicator = document.createElement('div');
                     indicator.className = 'device-indicator';
-                    if (deviceInfo.connected && deviceInfo.rssi !== null) {
-                        indicator.classList.add(getRSSIClass(deviceInfo.rssi));
-                    } else {
+                    // Connection first, RSSI only as a quality grade. These used
+                    // to be one condition, so a link with no RSSI reading (work
+                    // through a pty, which carries no radio metadata) drew as
+                    // disconnected even while the device's data was arriving.
+                    if (!deviceInfo.connected) {
                         indicator.classList.add('disconnected');
+                    } else if (deviceInfo.rssi === null || deviceInfo.rssi === undefined) {
+                        indicator.classList.add('excellent');
+                    } else {
+                        indicator.classList.add(getRSSIClass(deviceInfo.rssi));
                     }
                     
                     const name = document.createElement('span');
@@ -577,7 +592,9 @@ async function updateStatus() {
                     
                     const rssi = document.createElement('span');
                     rssi.className = 'device-rssi';
-                    if (deviceInfo.connected && deviceInfo.rssi !== null) {
+                    // The link has no RSSI to report (a wired dongle, or a pty);
+                    // say so rather than implying the device is missing.
+                    if (deviceInfo.rssi !== null && deviceInfo.rssi !== undefined) {
                         rssi.textContent = `${deviceInfo.rssi} dBm`;
                     } else {
                         rssi.textContent = '--';
